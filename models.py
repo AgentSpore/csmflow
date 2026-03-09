@@ -14,6 +14,17 @@ class CustomerCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class CustomerUpdate(BaseModel):
+    name: Optional[str] = None
+    company: Optional[str] = None
+    email: Optional[str] = None
+    plan: Optional[str] = None
+    mrr: Optional[float] = Field(default=None, ge=0)
+    owner_email: Optional[str] = None
+    onboarded_at: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class CustomerResponse(BaseModel):
     id: int
     name: str
