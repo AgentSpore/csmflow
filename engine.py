@@ -244,3 +244,16 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "touchpoints_this_month": tp_count,
         "upcoming_actions": upcoming_count,
     }
+
+async def update_customer(db: aiosqlite.Connection, customer_id: int, updates: dict) -> dict | None:
+    """Partially update customer fields — only non-None values are written."""
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return await get_customer(db, customer_id)
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [customer_id]
+    cur = await db.execute(f"UPDATE customers SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_customer(db, customer_id)
