@@ -15,6 +15,7 @@ from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
     add_touchpoint, list_touchpoints,
     create_playbook, list_playbooks, get_csm_stats,
+    list_upcoming_actions, get_stats_by_owner,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="CSMFlow",
     description="Customer success management pipeline: health scores, touchpoints, playbooks, QBR tracker.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -38,7 +39,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -50,8 +51,8 @@ async def add_customer(body: CustomerCreate):
 
 @app.get("/customers", response_model=list[CustomerResponse])
 async def get_customers(
-    health: str | None = Query(None, description="Filter: critical | at_risk | neutral | healthy | champion"),
-    plan: str | None = Query(None, description="Filter by plan tier"),
+    health: str | None = Query(None, description="critical | at_risk | neutral | healthy | champion"),
+    plan: str | None = Query(None),
 ):
     return await list_customers(app.state.db, health, plan)
 
@@ -66,11 +67,6 @@ async def get_customer_detail(customer_id: int):
 
 @app.patch("/customers/{customer_id}", response_model=CustomerResponse)
 async def patch_customer(customer_id: int, body: CustomerUpdate):
-    """
-    Partially update a customer record.
-    Use to reflect plan upgrades, MRR changes, owner reassignments, or annotation updates.
-    Only provided (non-null) fields are overwritten.
-    """
     c = await update_customer(app.state.db, customer_id, body.model_dump(exclude_unset=True))
     if not c:
         raise HTTPException(404, "Customer not found")
@@ -99,9 +95,19 @@ async def log_touchpoint(body: TouchpointCreate):
     return await add_touchpoint(app.state.db, body.model_dump())
 
 
+# /touchpoints/upcoming BEFORE /touchpoints to avoid ambiguity
+@app.get("/touchpoints/upcoming")
+async def upcoming_actions(
+    days: int = Query(7, ge=1, le=90, description="Look-ahead window in days"),
+    customer_id: int | None = Query(None),
+):
+    """List all pending CSM next-actions due within the next N days, sorted by date."""
+    return await list_upcoming_actions(app.state.db, days, customer_id)
+
+
 @app.get("/touchpoints", response_model=list[TouchpointResponse])
 async def get_touchpoints(
-    customer_id: int | None = Query(None, description="Filter by customer"),
+    customer_id: int | None = Query(None),
 ):
     return await list_touchpoints(app.state.db, customer_id)
 
@@ -119,6 +125,12 @@ async def get_playbooks():
 
 
 # ── Stats ────────────────────────────────────────────────────────────────
+
+@app.get("/stats/by-owner")
+async def stats_by_owner():
+    """Per-CSM breakdown: customers, MRR, avg health, at-risk count, touchpoints last 30d."""
+    return await get_stats_by_owner(app.state.db)
+
 
 @app.get("/stats", response_model=CSMStats)
 async def csm_stats():
