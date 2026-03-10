@@ -101,18 +101,12 @@ def _playbook_row(r: aiosqlite.Row) -> dict:
 
 def compute_health_score(login_freq: int, feature_adoption: int,
                          support_tickets: int, nps: int | None, days_to_value: int | None) -> int:
-    """Compute 0-100 health score from usage signals."""
-    score = 50  # baseline
-    # Login frequency: up to +20
+    score = 50
     score += min(login_freq * 2, 20)
-    # Feature adoption: up to +20
     score += min(feature_adoption * 2, 20)
-    # Support tickets: -5 per open ticket, max -20
     score -= min(support_tickets * 5, 20)
-    # NPS: map 0-10 to -15 to +15
     if nps is not None:
         score += (nps - 5) * 3
-    # Days to value: fast = good
     if days_to_value is not None:
         if days_to_value <= 7:
             score += 10
@@ -157,13 +151,25 @@ async def get_customer(db: aiosqlite.Connection, customer_id: int) -> dict | Non
     return _customer_row(rows[0]) if rows else None
 
 
+async def update_customer(db: aiosqlite.Connection, customer_id: int, updates: dict) -> dict | None:
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return await get_customer(db, customer_id)
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [customer_id]
+    cur = await db.execute(f"UPDATE customers SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_customer(db, customer_id)
+
+
 async def update_health(db: aiosqlite.Connection, customer_id: int,
                         login_freq: int, feature_adoption: int,
                         support_tickets: int, nps: int | None, days_to_value: int | None) -> dict | None:
     score = compute_health_score(login_freq, feature_adoption, support_tickets, nps, days_to_value)
     await db.execute("UPDATE customers SET health_score = ? WHERE id = ?", (score, customer_id))
     await db.commit()
-    # Auto-trigger playbooks
     label = _health_label(score)
     if label in ("critical", "at_risk"):
         await _trigger_playbooks(db, customer_id, "low_health")
@@ -220,21 +226,17 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     if not customers:
         return {"total_customers": 0, "total_mrr": 0.0, "avg_health_score": 0.0,
                 "at_risk_count": 0, "healthy_count": 0, "touchpoints_this_month": 0, "upcoming_actions": 0}
-
     total_mrr = sum(r["mrr"] for r in customers)
     avg_health = round(sum(r["health_score"] for r in customers) / len(customers), 1)
     at_risk = sum(1 for r in customers if r["health_score"] < 50)
     healthy = sum(1 for r in customers if r["health_score"] >= 70)
-
     month_start = (datetime.utcnow().replace(day=1)).isoformat()
     tp_rows = await db.execute_fetchall(
         "SELECT COUNT(*) as cnt FROM touchpoints WHERE created_at >= ?", (month_start,))
     tp_count = tp_rows[0]["cnt"] if tp_rows else 0
-
     upcoming = await db.execute_fetchall(
         "SELECT COUNT(*) as cnt FROM touchpoints WHERE next_action IS NOT NULL AND next_action_date >= date('now')")
     upcoming_count = upcoming[0]["cnt"] if upcoming else 0
-
     return {
         "total_customers": len(customers),
         "total_mrr": round(total_mrr, 2),
@@ -245,15 +247,62 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "upcoming_actions": upcoming_count,
     }
 
-async def update_customer(db: aiosqlite.Connection, customer_id: int, updates: dict) -> dict | None:
-    """Partially update customer fields — only non-None values are written."""
-    fields = {k: v for k, v in updates.items() if v is not None}
-    if not fields:
-        return await get_customer(db, customer_id)
-    set_clause = ", ".join(f"{k} = ?" for k in fields)
-    values = list(fields.values()) + [customer_id]
-    cur = await db.execute(f"UPDATE customers SET {set_clause} WHERE id = ?", values)
-    await db.commit()
-    if cur.rowcount == 0:
-        return None
-    return await get_customer(db, customer_id)
+
+async def list_upcoming_actions(db: aiosqlite.Connection,
+                                 days: int = 7,
+                                 customer_id: int | None = None) -> list[dict]:
+    today = datetime.utcnow().date().isoformat()
+    until = (datetime.utcnow().date() + timedelta(days=days)).isoformat()
+    q = """SELECT t.*, c.name as customer_name, c.company, c.owner_email
+           FROM touchpoints t
+           JOIN customers c ON t.customer_id = c.id
+           WHERE t.next_action IS NOT NULL
+             AND t.next_action_date >= ?
+             AND t.next_action_date <= ?"""
+    params: list = [today, until]
+    if customer_id:
+        q += " AND t.customer_id = ?"
+        params.append(customer_id)
+    q += " ORDER BY t.next_action_date ASC"
+    rows = await db.execute_fetchall(q, params)
+    result = []
+    for r in rows:
+        d = _touchpoint_row(r)
+        d["customer_name"] = r["customer_name"]
+        d["company"] = r["company"]
+        d["owner_email"] = r["owner_email"]
+        result.append(d)
+    return result
+
+
+async def get_stats_by_owner(db: aiosqlite.Connection) -> list[dict]:
+    owners = await db.execute_fetchall(
+        "SELECT DISTINCT owner_email FROM customers WHERE owner_email IS NOT NULL ORDER BY owner_email"
+    )
+    result = []
+    since_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
+    for o in owners:
+        owner = o["owner_email"]
+        custs = await db.execute_fetchall(
+            "SELECT * FROM customers WHERE owner_email = ?", (owner,)
+        )
+        total = len(custs)
+        mrr = sum(c["mrr"] for c in custs)
+        avg_health = round(sum(c["health_score"] for c in custs) / total, 1) if total else 0
+        at_risk = sum(1 for c in custs if c["health_score"] < 50)
+        ids = tuple(c["id"] for c in custs)
+        placeholders = ",".join("?" * len(ids))
+        tp_rows = await db.execute_fetchall(
+            f"SELECT COUNT(*) as cnt FROM touchpoints WHERE customer_id IN ({placeholders}) AND created_at >= ?",
+            (*ids, since_30d)
+        ) if ids else []
+        tp_count = tp_rows[0]["cnt"] if tp_rows else 0
+        result.append({
+            "owner_email": owner,
+            "customers": total,
+            "total_mrr": round(mrr, 2),
+            "avg_health_score": avg_health,
+            "at_risk_count": at_risk,
+            "touchpoints_last_30d": tp_count,
+        })
+    return result
