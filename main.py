@@ -10,12 +10,14 @@ from models import (
     TouchpointCreate, TouchpointResponse,
     PlaybookCreate, PlaybookResponse,
     HealthScoreUpdate, CSMStats,
+    RenewalUpdate, RenewalPipelineItem,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
     add_touchpoint, list_touchpoints,
     create_playbook, list_playbooks, get_csm_stats,
     list_upcoming_actions, get_stats_by_owner,
+    set_renewal, get_renewal_pipeline, get_at_risk_renewals, delete_customer,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -30,8 +32,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CSMFlow",
-    description="Customer success management pipeline: health scores, touchpoints, playbooks, QBR tracker.",
-    version="0.3.0",
+    description="Customer success management pipeline: health scores, touchpoints, playbooks, renewal tracking.",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -39,7 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -73,6 +75,13 @@ async def patch_customer(customer_id: int, body: CustomerUpdate):
     return c
 
 
+@app.delete("/customers/{customer_id}", status_code=204)
+async def remove_customer(customer_id: int):
+    deleted = await delete_customer(app.state.db, customer_id)
+    if not deleted:
+        raise HTTPException(404, "Customer not found")
+
+
 @app.post("/customers/{customer_id}/health", response_model=CustomerResponse)
 async def update_customer_health(customer_id: int, body: HealthScoreUpdate):
     c = await get_customer(app.state.db, customer_id)
@@ -83,6 +92,32 @@ async def update_customer_health(customer_id: int, body: HealthScoreUpdate):
         body.login_frequency, body.feature_adoption,
         body.support_tickets, body.nps_score, body.days_to_value,
     )
+
+
+@app.post("/customers/{customer_id}/renewal", response_model=CustomerResponse)
+async def update_renewal(customer_id: int, body: RenewalUpdate):
+    c = await set_renewal(app.state.db, customer_id, body.renewal_date, body.contract_value)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return c
+
+
+# ── Renewals ─────────────────────────────────────────────────────────────
+
+@app.get("/renewals/at-risk", response_model=list[RenewalPipelineItem])
+async def at_risk_renewals(
+    days: int = Query(90, ge=1, le=365, description="Look-ahead window in days"),
+):
+    """Renewals where customer health is at_risk or critical, sorted by urgency."""
+    return await get_at_risk_renewals(app.state.db, days)
+
+
+@app.get("/renewals/pipeline", response_model=list[RenewalPipelineItem])
+async def renewal_pipeline(
+    days: int = Query(90, ge=1, le=365, description="Look-ahead window in days"),
+):
+    """All upcoming renewals within the next N days, sorted by date."""
+    return await get_renewal_pipeline(app.state.db, days)
 
 
 # ── Touchpoints ──────────────────────────────────────────────────────────
