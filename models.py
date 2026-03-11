@@ -37,8 +37,30 @@ class CustomerResponse(BaseModel):
     owner_email: Optional[str]
     onboarded_at: Optional[str]
     days_since_onboarding: Optional[int]
+    renewal_date: Optional[str]
+    contract_value: Optional[float]
     notes: Optional[str]
     created_at: str
+
+
+class RenewalUpdate(BaseModel):
+    renewal_date: str = Field(..., description="ISO date (YYYY-MM-DD) of next renewal")
+    contract_value: float = Field(..., ge=0, description="Annual contract value")
+
+
+class RenewalPipelineItem(BaseModel):
+    customer_id: int
+    name: str
+    company: str
+    plan: str
+    mrr: float
+    health_score: int
+    health_label: str
+    renewal_date: str
+    contract_value: float
+    days_until_renewal: int
+    owner_email: Optional[str]
+    last_touchpoint_date: Optional[str]
 
 
 class TouchpointCreate(BaseModel):
@@ -94,3 +116,5 @@ class CSMStats(BaseModel):
     healthy_count: int
     touchpoints_this_month: int
     upcoming_actions: int
+    renewals_next_30d: int
+    at_risk_renewal_value: float

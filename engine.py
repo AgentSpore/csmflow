@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS customers (
     health_score INTEGER NOT NULL DEFAULT 50,
     owner_email TEXT,
     onboarded_at TEXT,
+    renewal_date TEXT,
+    contract_value REAL,
     notes TEXT,
     created_at TEXT NOT NULL
 );
@@ -42,6 +44,11 @@ CREATE TABLE IF NOT EXISTS playbooks (
 );
 """
 
+MIGRATION_RENEWAL = """
+ALTER TABLE customers ADD COLUMN renewal_date TEXT;
+ALTER TABLE customers ADD COLUMN contract_value REAL;
+"""
+
 HEALTH_LABELS = {
     range(0, 30):  "critical",
     range(30, 50): "at_risk",
@@ -62,6 +69,17 @@ async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SQL)
+    # Migration for existing DBs
+    try:
+        await db.execute("SELECT renewal_date FROM customers LIMIT 1")
+    except Exception:
+        for stmt in MIGRATION_RENEWAL.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    await db.execute(stmt)
+                except Exception:
+                    pass
     await db.commit()
     return db
 
@@ -72,13 +90,16 @@ def _customer_row(r: aiosqlite.Row) -> dict:
         try:
             onboarded = datetime.fromisoformat(r["onboarded_at"]).date()
             days = (datetime.utcnow().date() - onboarded).days
-        except: pass
+        except Exception:
+            pass
     return {
         "id": r["id"], "name": r["name"], "company": r["company"],
         "email": r["email"], "plan": r["plan"], "mrr": r["mrr"],
         "health_score": r["health_score"], "health_label": _health_label(r["health_score"]),
         "owner_email": r["owner_email"], "onboarded_at": r["onboarded_at"],
-        "days_since_onboarding": days, "notes": r["notes"], "created_at": r["created_at"],
+        "days_since_onboarding": days,
+        "renewal_date": r["renewal_date"], "contract_value": r["contract_value"],
+        "notes": r["notes"], "created_at": r["created_at"],
     }
 
 
@@ -183,6 +204,67 @@ async def _trigger_playbooks(db: aiosqlite.Connection, customer_id: int, trigger
     await db.commit()
 
 
+async def set_renewal(db: aiosqlite.Connection, customer_id: int, renewal_date: str, contract_value: float) -> dict | None:
+    cur = await db.execute(
+        "UPDATE customers SET renewal_date = ?, contract_value = ? WHERE id = ?",
+        (renewal_date, contract_value, customer_id)
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_customer(db, customer_id)
+
+
+async def get_renewal_pipeline(db: aiosqlite.Connection, days: int = 90) -> list[dict]:
+    today = datetime.utcnow().date().isoformat()
+    until = (datetime.utcnow().date() + timedelta(days=days)).isoformat()
+    rows = await db.execute_fetchall(
+        """SELECT c.*, (
+               SELECT MAX(t.created_at) FROM touchpoints t WHERE t.customer_id = c.id
+           ) as last_tp_date
+           FROM customers c
+           WHERE c.renewal_date IS NOT NULL
+             AND c.renewal_date >= ?
+             AND c.renewal_date <= ?
+           ORDER BY c.renewal_date ASC""",
+        (today, until)
+    )
+    result = []
+    for r in rows:
+        renewal_dt = datetime.fromisoformat(r["renewal_date"]).date()
+        days_until = (renewal_dt - datetime.utcnow().date()).days
+        result.append({
+            "customer_id": r["id"],
+            "name": r["name"],
+            "company": r["company"],
+            "plan": r["plan"],
+            "mrr": r["mrr"],
+            "health_score": r["health_score"],
+            "health_label": _health_label(r["health_score"]),
+            "renewal_date": r["renewal_date"],
+            "contract_value": r["contract_value"] or 0,
+            "days_until_renewal": days_until,
+            "owner_email": r["owner_email"],
+            "last_touchpoint_date": r["last_tp_date"],
+        })
+    return result
+
+
+async def get_at_risk_renewals(db: aiosqlite.Connection, days: int = 90) -> list[dict]:
+    pipeline = await get_renewal_pipeline(db, days)
+    return [r for r in pipeline if r["health_label"] in ("critical", "at_risk")]
+
+
+async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
+    rows = await db.execute_fetchall("SELECT id FROM customers WHERE id = ?", (customer_id,))
+    if not rows:
+        return False
+    await db.execute("DELETE FROM touchpoints WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
+    await db.commit()
+    return True
+
+
 async def add_touchpoint(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
@@ -225,7 +307,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     customers = await db.execute_fetchall("SELECT * FROM customers")
     if not customers:
         return {"total_customers": 0, "total_mrr": 0.0, "avg_health_score": 0.0,
-                "at_risk_count": 0, "healthy_count": 0, "touchpoints_this_month": 0, "upcoming_actions": 0}
+                "at_risk_count": 0, "healthy_count": 0, "touchpoints_this_month": 0,
+                "upcoming_actions": 0, "renewals_next_30d": 0, "at_risk_renewal_value": 0.0}
     total_mrr = sum(r["mrr"] for r in customers)
     avg_health = round(sum(r["health_score"] for r in customers) / len(customers), 1)
     at_risk = sum(1 for r in customers if r["health_score"] < 50)
@@ -237,6 +320,17 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     upcoming = await db.execute_fetchall(
         "SELECT COUNT(*) as cnt FROM touchpoints WHERE next_action IS NOT NULL AND next_action_date >= date('now')")
     upcoming_count = upcoming[0]["cnt"] if upcoming else 0
+    # Renewal stats
+    today = datetime.utcnow().date().isoformat()
+    until_30 = (datetime.utcnow().date() + timedelta(days=30)).isoformat()
+    renew_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM customers WHERE renewal_date IS NOT NULL AND renewal_date >= ? AND renewal_date <= ?",
+        (today, until_30))
+    renewals_30d = renew_rows[0]["cnt"] if renew_rows else 0
+    risk_rows = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(contract_value), 0) as val FROM customers WHERE renewal_date IS NOT NULL AND renewal_date >= ? AND renewal_date <= ? AND health_score < 50",
+        (today, until_30))
+    at_risk_val = risk_rows[0]["val"] if risk_rows else 0
     return {
         "total_customers": len(customers),
         "total_mrr": round(total_mrr, 2),
@@ -245,6 +339,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "healthy_count": healthy,
         "touchpoints_this_month": tp_count,
         "upcoming_actions": upcoming_count,
+        "renewals_next_30d": renewals_30d,
+        "at_risk_renewal_value": round(at_risk_val, 2),
     }
 
 
