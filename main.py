@@ -20,6 +20,9 @@ from models import (
     ChurnRisk,
     ContactCreate, ContactResponse,
     GoalCreate, GoalUpdate, GoalResponse,
+    HandoffCreate, HandoffResponse,
+    MilestoneCreate, MilestoneResponse, MilestoneCoverage, MilestoneAnalytics,
+    EscalationCreate, EscalationUpdate, EscalationResponse, EscalationStats,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
@@ -38,6 +41,12 @@ from engine import (
     add_contact, list_contacts, update_contact_last_contacted, delete_contact,
     create_goal, list_goals, update_goal, get_at_risk_goals,
     export_customers_csv,
+    # v0.9.0 — Handoffs
+    create_handoff, list_handoffs, complete_handoff, cancel_handoff,
+    # v0.9.0 — Milestones
+    add_milestone, list_milestones, delete_milestone, get_milestone_coverage, get_milestone_analytics,
+    # v0.9.0 — Escalations
+    create_escalation, list_escalations, get_escalation, update_escalation, get_escalation_stats,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -57,9 +66,11 @@ app = FastAPI(
         "renewal tracking, QBRs, segments, expansion tracking, team performance, "
         "customer tags, NPS surveys with trend analysis, churn risk assessment, "
         "stakeholder contacts with role mapping, customer goals with progress tracking, "
-        "and customer CSV export for reporting."
+        "customer CSV export, customer handoff/transfer with audit trail, "
+        "lifecycle milestones with coverage analytics, and escalation management "
+        "with SLA tracking."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -67,7 +78,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.8.0"}
+    return {"status": "ok", "version": "0.9.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -248,6 +259,152 @@ async def at_risk_goals():
     return await get_at_risk_goals(app.state.db)
 
 
+# ── Customer Handoff / Transfer (v0.9.0) ────────────────────────────────
+
+@app.post("/customers/{customer_id}/handoff", response_model=HandoffResponse, status_code=201)
+async def initiate_handoff(customer_id: int, body: HandoffCreate):
+    """Transfer a customer to a new CSM owner with full audit trail."""
+    result = await create_handoff(app.state.db, customer_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Customer not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+@app.get("/handoffs", response_model=list[HandoffResponse])
+async def get_handoffs(
+    customer_id: int | None = Query(None),
+    from_owner: str | None = Query(None, description="Filter by source CSM email"),
+    to_owner: str | None = Query(None, description="Filter by destination CSM email"),
+    status: str | None = Query(None, description="pending | completed | cancelled"),
+):
+    """List handoffs with optional filters."""
+    return await list_handoffs(app.state.db, customer_id, from_owner, to_owner, status)
+
+
+@app.post("/handoffs/{handoff_id}/complete", response_model=HandoffResponse)
+async def complete_handoff_endpoint(handoff_id: int):
+    """Mark a pending handoff as completed."""
+    result = await complete_handoff(app.state.db, handoff_id)
+    if result is None:
+        raise HTTPException(404, "Handoff not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+@app.post("/handoffs/{handoff_id}/cancel", response_model=HandoffResponse)
+async def cancel_handoff_endpoint(handoff_id: int):
+    """Cancel a pending handoff."""
+    result = await cancel_handoff(app.state.db, handoff_id)
+    if result is None:
+        raise HTTPException(404, "Handoff not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+# ── Customer Milestones (v0.9.0) ────────────────────────────────────────
+
+@app.post("/customers/{customer_id}/milestones", response_model=MilestoneResponse, status_code=201)
+async def create_milestone(customer_id: int, body: MilestoneCreate):
+    """Record a lifecycle milestone for a customer. Duplicate types per customer are rejected."""
+    result = await add_milestone(app.state.db, customer_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Customer not found")
+    if isinstance(result, str):
+        if result == "duplicate_milestone":
+            raise HTTPException(409, "This milestone type has already been achieved for this customer")
+        raise HTTPException(422, result)
+    return result
+
+
+@app.get("/customers/{customer_id}/milestones", response_model=list[MilestoneResponse])
+async def get_milestones(
+    customer_id: int,
+    milestone_type: str | None = Query(None, description="Filter by milestone type"),
+):
+    """List milestones for a customer."""
+    c = await get_customer(app.state.db, customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await list_milestones(app.state.db, customer_id, milestone_type)
+
+
+@app.delete("/milestones/{milestone_id}", status_code=204)
+async def remove_milestone(milestone_id: int):
+    """Delete a milestone by ID."""
+    if not await delete_milestone(app.state.db, milestone_id):
+        raise HTTPException(404, "Milestone not found")
+
+
+@app.get("/customers/{customer_id}/milestone-coverage", response_model=MilestoneCoverage)
+async def milestone_coverage(customer_id: int):
+    """Get percentage of lifecycle milestones achieved for a customer."""
+    result = await get_milestone_coverage(app.state.db, customer_id)
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
+
+
+@app.get("/analytics/milestones", response_model=MilestoneAnalytics)
+async def milestone_analytics():
+    """Analytics: which milestones are most/least achieved across all customers."""
+    return await get_milestone_analytics(app.state.db)
+
+
+# ── Escalation Management (v0.9.0) ──────────────────────────────────────
+
+@app.post("/customers/{customer_id}/escalations", response_model=EscalationResponse, status_code=201)
+async def create_customer_escalation(customer_id: int, body: EscalationCreate):
+    """Create an escalation for a customer with severity-based SLA defaults."""
+    result = await create_escalation(app.state.db, customer_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Customer not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+@app.get("/escalations", response_model=list[EscalationResponse])
+async def get_escalations(
+    customer_id: int | None = Query(None),
+    status: str | None = Query(None, description="open | investigating | pending_resolution | resolved | closed"),
+    severity: str | None = Query(None, description="critical | high | medium | low"),
+    category: str | None = Query(None, description="support | billing | executive | technical | legal"),
+    assigned_to: str | None = Query(None, description="Filter by assignee email"),
+):
+    """List escalations with optional filters."""
+    return await list_escalations(app.state.db, customer_id, status, severity, category, assigned_to)
+
+
+@app.get("/escalations/{escalation_id}", response_model=EscalationResponse)
+async def get_escalation_detail(escalation_id: int):
+    """Get a single escalation by ID."""
+    result = await get_escalation(app.state.db, escalation_id)
+    if not result:
+        raise HTTPException(404, "Escalation not found")
+    return result
+
+
+@app.patch("/escalations/{escalation_id}", response_model=EscalationResponse)
+async def patch_escalation(escalation_id: int, body: EscalationUpdate):
+    """Update escalation status, assignment, or resolution."""
+    result = await update_escalation(app.state.db, escalation_id, body.model_dump(exclude_unset=True))
+    if result is None:
+        raise HTTPException(404, "Escalation not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+@app.get("/analytics/escalations", response_model=EscalationStats)
+async def escalation_analytics():
+    """Escalation stats: totals, by status/severity, avg resolution hours, SLA breach rate."""
+    return await get_escalation_stats(app.state.db)
+
+
 # ── Churn Risk ───────────────────────────────────────────────────────────
 
 @app.get("/customers/{customer_id}/risk", response_model=ChurnRisk)
@@ -409,7 +566,7 @@ async def customer_timeline(
     customer_id: int,
     limit: int = Query(50, ge=1, le=500),
 ):
-    """Unified activity feed: touchpoints, QBRs, NPS surveys, goals, lifecycle events."""
+    """Unified activity feed: touchpoints, QBRs, NPS surveys, goals, milestones, escalations, handoffs, lifecycle events."""
     result = await get_customer_timeline(app.state.db, customer_id, limit)
     if not result:
         raise HTTPException(404, "Customer not found")
