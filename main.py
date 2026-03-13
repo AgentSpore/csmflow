@@ -15,6 +15,8 @@ from models import (
     SegmentUpdate, SegmentStats,
     CustomerTimeline, ExpansionCreate, ExpansionResponse,
     ExpansionStageUpdate, ExpansionPipeline, CSMPerformance,
+    TagRequest, NPSSurveyCreate, NPSSurveyResponse, NPSOverview,
+    ChurnRisk,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
@@ -27,6 +29,9 @@ from engine import (
     get_customer_timeline,
     create_expansion, list_expansions, update_expansion_stage, get_expansion_pipeline,
     get_team_performance,
+    add_customer_tag, remove_customer_tag,
+    record_nps_survey, list_nps_surveys, get_nps_overview,
+    compute_churn_risk,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -41,8 +46,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CSMFlow",
-    description="Customer success management pipeline: health scores, touchpoints, playbooks, renewal tracking, QBRs, segments.",
-    version="0.6.0",
+    description=(
+        "Customer success management pipeline: health scores, touchpoints, playbooks, "
+        "renewal tracking, QBRs, segments, expansion tracking, team performance, "
+        "customer tags, NPS surveys with trend analysis, and churn risk assessment."
+    ),
+    version="0.7.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -50,7 +59,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -65,8 +74,9 @@ async def get_customers(
     health: str | None = Query(None, description="critical | at_risk | neutral | healthy | champion"),
     plan: str | None = Query(None),
     segment: str | None = Query(None, description="enterprise | mid_market | smb | startup | general"),
+    tag: str | None = Query(None, description="Filter by tag"),
 ):
-    return await list_customers(app.state.db, health, plan, segment)
+    return await list_customers(app.state.db, health, plan, segment, tag)
 
 
 @app.get("/customers/{customer_id}", response_model=CustomerResponse)
@@ -118,6 +128,37 @@ async def update_segment(customer_id: int, body: SegmentUpdate):
     if not c:
         raise HTTPException(404, "Customer not found")
     return c
+
+
+# ── Customer Tags ────────────────────────────────────────────────────────
+
+@app.post("/customers/{customer_id}/tags", response_model=CustomerResponse)
+async def tag_customer(customer_id: int, body: TagRequest):
+    """Add a tag to a customer for flexible segmentation."""
+    result = await add_customer_tag(app.state.db, customer_id, body.tag)
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
+
+
+@app.delete("/customers/{customer_id}/tags", response_model=CustomerResponse)
+async def untag_customer(customer_id: int, body: TagRequest):
+    """Remove a tag from a customer."""
+    result = await remove_customer_tag(app.state.db, customer_id, body.tag)
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
+
+
+# ── Churn Risk ───────────────────────────────────────────────────────────
+
+@app.get("/customers/{customer_id}/risk", response_model=ChurnRisk)
+async def churn_risk(customer_id: int):
+    """Automated churn risk scoring based on health, renewal, touchpoints, NPS, and expansion data."""
+    result = await compute_churn_risk(app.state.db, customer_id)
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
 
 
 # ── Renewals ─────────────────────────────────────────────────────────────
@@ -174,6 +215,32 @@ async def add_playbook(body: PlaybookCreate):
 @app.get("/playbooks", response_model=list[PlaybookResponse])
 async def get_playbooks():
     return await list_playbooks(app.state.db)
+
+
+# ── NPS Surveys ──────────────────────────────────────────────────────────
+
+@app.post("/nps", response_model=NPSSurveyResponse, status_code=201)
+async def submit_nps(body: NPSSurveyCreate):
+    """Record an NPS survey response. Auto-triggers detractor playbook if score < 7."""
+    result = await record_nps_survey(app.state.db, body.model_dump())
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
+
+
+@app.get("/nps/overview", response_model=NPSOverview)
+async def nps_overview():
+    """NPS overview: overall score, category breakdown, per-segment analysis, 6-month trend."""
+    return await get_nps_overview(app.state.db)
+
+
+@app.get("/nps", response_model=list[NPSSurveyResponse])
+async def get_nps(
+    customer_id: int | None = Query(None),
+    category: str | None = Query(None, description="promoter | passive | detractor"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    return await list_nps_surveys(app.state.db, customer_id, category, limit)
 
 
 # ── QBRs ─────────────────────────────────────────────────────────────────
@@ -244,7 +311,7 @@ async def customer_timeline(
     customer_id: int,
     limit: int = Query(50, ge=1, le=500),
 ):
-    """Unified activity feed: touchpoints, QBRs, lifecycle events."""
+    """Unified activity feed: touchpoints, QBRs, NPS surveys, lifecycle events."""
     result = await get_customer_timeline(app.state.db, customer_id, limit)
     if not result:
         raise HTTPException(404, "Customer not found")

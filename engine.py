@@ -101,11 +101,41 @@ async def init_db(path: str) -> aiosqlite.Connection:
         await db.execute("SELECT segment FROM customers LIMIT 1")
     except Exception:
         await db.execute("ALTER TABLE customers ADD COLUMN segment TEXT NOT NULL DEFAULT 'general'")
+    # Migration: customer_tags table
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS customer_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(customer_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tags_customer ON customer_tags(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_tags_tag ON customer_tags(tag);
+    """)
+    # Migration: nps_surveys table
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS nps_surveys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            score INTEGER NOT NULL,
+            feedback TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_nps_customer ON nps_surveys(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_nps_date ON nps_surveys(created_at);
+    """)
     await db.commit()
     return db
 
 
-def _customer_row(r: aiosqlite.Row) -> dict:
+async def _get_customer_tags(db: aiosqlite.Connection, customer_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT tag FROM customer_tags WHERE customer_id = ? ORDER BY tag", (customer_id,))
+    return [r["tag"] for r in rows]
+
+
+def _customer_row(r: aiosqlite.Row, tags: list[str] | None = None) -> dict:
     days = None
     if r["onboarded_at"]:
         try:
@@ -121,6 +151,7 @@ def _customer_row(r: aiosqlite.Row) -> dict:
         "days_since_onboarding": days,
         "renewal_date": r["renewal_date"], "contract_value": r["contract_value"],
         "segment": r["segment"] if "segment" in r.keys() else "general",
+        "tags": tags or [],
         "notes": r["notes"], "created_at": r["created_at"],
     }
 
@@ -171,21 +202,30 @@ async def create_customer(db: aiosqlite.Connection, data: dict) -> dict:
     )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM customers WHERE id = ?", (cur.lastrowid,))
-    return _customer_row(rows[0])
+    tags = await _get_customer_tags(db, cur.lastrowid)
+    return _customer_row(rows[0], tags)
 
 
-async def list_customers(db: aiosqlite.Connection, health: str | None = None, plan: str | None = None, segment: str | None = None) -> list[dict]:
+async def list_customers(db: aiosqlite.Connection, health: str | None = None,
+                         plan: str | None = None, segment: str | None = None,
+                         tag: str | None = None) -> list[dict]:
     q = "SELECT * FROM customers"
     conds, params = [], []
     if plan:
         conds.append("plan = ?"); params.append(plan)
     if segment:
         conds.append("segment = ?"); params.append(segment)
+    if tag:
+        conds.append("id IN (SELECT customer_id FROM customer_tags WHERE tag = ?)")
+        params.append(tag)
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY mrr DESC"
     rows = await db.execute_fetchall(q, params)
-    result = [_customer_row(r) for r in rows]
+    result = []
+    for r in rows:
+        tags = await _get_customer_tags(db, r["id"])
+        result.append(_customer_row(r, tags))
     if health:
         result = [c for c in result if c["health_label"] == health]
     return result
@@ -193,7 +233,10 @@ async def list_customers(db: aiosqlite.Connection, health: str | None = None, pl
 
 async def get_customer(db: aiosqlite.Connection, customer_id: int) -> dict | None:
     rows = await db.execute_fetchall("SELECT * FROM customers WHERE id = ?", (customer_id,))
-    return _customer_row(rows[0]) if rows else None
+    if not rows:
+        return None
+    tags = await _get_customer_tags(db, customer_id)
+    return _customer_row(rows[0], tags)
 
 
 async def update_customer(db: aiosqlite.Connection, customer_id: int, updates: dict) -> dict | None:
@@ -283,6 +326,8 @@ async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
     rows = await db.execute_fetchall("SELECT id FROM customers WHERE id = ?", (customer_id,))
     if not rows:
         return False
+    await db.execute("DELETE FROM customer_tags WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM nps_surveys WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM touchpoints WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     await db.commit()
@@ -332,7 +377,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     if not customers:
         return {"total_customers": 0, "total_mrr": 0.0, "avg_health_score": 0.0,
                 "at_risk_count": 0, "healthy_count": 0, "touchpoints_this_month": 0,
-                "upcoming_actions": 0, "renewals_next_30d": 0, "at_risk_renewal_value": 0.0}
+                "upcoming_actions": 0, "renewals_next_30d": 0, "at_risk_renewal_value": 0.0,
+                "total_nps_surveys": 0, "avg_nps": 0.0}
     total_mrr = sum(r["mrr"] for r in customers)
     avg_health = round(sum(r["health_score"] for r in customers) / len(customers), 1)
     at_risk = sum(1 for r in customers if r["health_score"] < 50)
@@ -344,7 +390,6 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     upcoming = await db.execute_fetchall(
         "SELECT COUNT(*) as cnt FROM touchpoints WHERE next_action IS NOT NULL AND next_action_date >= date('now')")
     upcoming_count = upcoming[0]["cnt"] if upcoming else 0
-    # Renewal stats
     today = datetime.utcnow().date().isoformat()
     until_30 = (datetime.utcnow().date() + timedelta(days=30)).isoformat()
     renew_rows = await db.execute_fetchall(
@@ -355,6 +400,10 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "SELECT COALESCE(SUM(contract_value), 0) as val FROM customers WHERE renewal_date IS NOT NULL AND renewal_date >= ? AND renewal_date <= ? AND health_score < 50",
         (today, until_30))
     at_risk_val = risk_rows[0]["val"] if risk_rows else 0
+    # NPS stats
+    nps_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt, COALESCE(AVG(score), 0) as avg FROM nps_surveys")
+    nps_total = nps_rows[0]["cnt"] if nps_rows else 0
+    nps_avg = round(nps_rows[0]["avg"], 1) if nps_rows else 0.0
     return {
         "total_customers": len(customers),
         "total_mrr": round(total_mrr, 2),
@@ -365,6 +414,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "upcoming_actions": upcoming_count,
         "renewals_next_30d": renewals_30d,
         "at_risk_renewal_value": round(at_risk_val, 2),
+        "total_nps_surveys": nps_total,
+        "avg_nps": nps_avg,
     }
 
 
@@ -537,7 +588,6 @@ async def get_segment_stats(db: aiosqlite.Connection) -> list[dict]:
 
 async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
                                  limit: int = 50) -> dict | None:
-    """Unified activity feed for a customer: touchpoints, health changes, QBRs, renewals."""
     customer = await get_customer(db, customer_id)
     if not customer:
         return None
@@ -581,6 +631,21 @@ async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
                 "timestamp": q["created_at"],
             })
 
+    # NPS surveys
+    nps_rows = await db.execute_fetchall(
+        "SELECT * FROM nps_surveys WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for n in nps_rows:
+        cat = _nps_category(n["score"])
+        events.append({
+            "type": "nps_survey",
+            "subtype": cat,
+            "summary": f"NPS survey: {n['score']}/10 ({cat}){' — ' + n['feedback'] if n['feedback'] else ''}",
+            "outcome": "positive" if cat == "promoter" else ("negative" if cat == "detractor" else "neutral"),
+            "timestamp": n["created_at"],
+        })
+
     # Customer creation
     events.append({
         "type": "customer_created",
@@ -606,7 +671,6 @@ VALID_OPP_STAGES = {"identified", "qualified", "proposal", "negotiation", "won",
 
 
 async def _migrate_expansions(db: aiosqlite.Connection):
-    """Create expansions table if needed."""
     await db.executescript("""
         CREATE TABLE IF NOT EXISTS expansions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -692,7 +756,6 @@ async def update_expansion_stage(db: aiosqlite.Connection, exp_id: int,
 
 
 async def get_expansion_pipeline(db: aiosqlite.Connection) -> dict:
-    """Expansion revenue pipeline grouped by stage."""
     await _migrate_expansions(db)
     rows = await db.execute_fetchall("""
         SELECT stage, COUNT(*) as count, COALESCE(SUM(expected_mrr), 0) as total_mrr
@@ -712,7 +775,6 @@ async def get_expansion_pipeline(db: aiosqlite.Connection) -> dict:
 # ── Team Performance ────────────────────────────────────────────────────
 
 async def get_team_performance(db: aiosqlite.Connection) -> list[dict]:
-    """Per-CSM performance metrics: customers, MRR, health improvement, touchpoint frequency, renewal rate."""
     owners = await db.execute_fetchall(
         "SELECT DISTINCT owner_email FROM customers WHERE owner_email IS NOT NULL"
     )
@@ -732,7 +794,6 @@ async def get_team_performance(db: aiosqlite.Connection) -> list[dict]:
         ids = tuple(c["id"] for c in custs)
         placeholders = ",".join("?" * len(ids))
 
-        # Touchpoints last 30d
         since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         tp_rows = await db.execute_fetchall(
             f"SELECT COUNT(*) as cnt FROM touchpoints WHERE customer_id IN ({placeholders}) AND created_at >= ?",
@@ -740,7 +801,6 @@ async def get_team_performance(db: aiosqlite.Connection) -> list[dict]:
         )
         tp_30d = tp_rows[0]["cnt"] if tp_rows else 0
 
-        # Renewal success rate
         today = datetime.utcnow().date().isoformat()
         past_renewals = await db.execute_fetchall(
             f"SELECT COUNT(*) as total, SUM(CASE WHEN health_score >= 50 THEN 1 ELSE 0 END) as healthy FROM customers WHERE owner_email = ? AND renewal_date IS NOT NULL AND renewal_date <= ?",
@@ -763,3 +823,310 @@ async def get_team_performance(db: aiosqlite.Connection) -> list[dict]:
         })
     result.sort(key=lambda x: x["total_mrr"], reverse=True)
     return result
+
+
+# ── Customer Tags ───────────────────────────────────────────────────────
+
+async def add_customer_tag(db: aiosqlite.Connection, customer_id: int, tag: str) -> dict | None:
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO customer_tags (customer_id, tag, created_at) VALUES (?, ?, ?)",
+            (customer_id, tag.strip().lower(), now),
+        )
+        await db.commit()
+    except Exception:
+        pass  # UNIQUE constraint — tag already exists, that's fine
+    return await get_customer(db, customer_id)
+
+
+async def remove_customer_tag(db: aiosqlite.Connection, customer_id: int, tag: str) -> dict | None:
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+    await db.execute(
+        "DELETE FROM customer_tags WHERE customer_id = ? AND tag = ?",
+        (customer_id, tag.strip().lower()),
+    )
+    await db.commit()
+    return await get_customer(db, customer_id)
+
+
+# ── NPS Surveys ─────────────────────────────────────────────────────────
+
+def _nps_category(score: int) -> str:
+    if score >= 9:
+        return "promoter"
+    elif score >= 7:
+        return "passive"
+    return "detractor"
+
+
+async def record_nps_survey(db: aiosqlite.Connection, data: dict) -> dict | None:
+    """Record an NPS survey response. Triggers nps_detractor playbook if score < 7."""
+    customer = await get_customer(db, data["customer_id"])
+    if not customer:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO nps_surveys (customer_id, score, feedback, created_at) VALUES (?, ?, ?, ?)",
+        (data["customer_id"], data["score"], data.get("feedback"), now),
+    )
+    await db.commit()
+    # Trigger playbook for detractors
+    if data["score"] < 7:
+        await _trigger_playbooks(db, data["customer_id"], "nps_detractor")
+    rows = await db.execute_fetchall("SELECT * FROM nps_surveys WHERE id = ?", (cur.lastrowid,))
+    r = rows[0]
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "customer_name": customer["name"],
+        "score": r["score"],
+        "category": _nps_category(r["score"]),
+        "feedback": r["feedback"],
+        "created_at": r["created_at"],
+    }
+
+
+async def list_nps_surveys(db: aiosqlite.Connection, customer_id: int | None = None,
+                            category: str | None = None,
+                            limit: int = 100) -> list[dict]:
+    q = """SELECT n.*, c.name as customer_name FROM nps_surveys n
+           JOIN customers c ON n.customer_id = c.id WHERE 1=1"""
+    params: list = []
+    if customer_id:
+        q += " AND n.customer_id = ?"
+        params.append(customer_id)
+    q += " ORDER BY n.created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = await db.execute_fetchall(q, params)
+    result = []
+    for r in rows:
+        cat = _nps_category(r["score"])
+        if category and cat != category:
+            continue
+        result.append({
+            "id": r["id"],
+            "customer_id": r["customer_id"],
+            "customer_name": r["customer_name"],
+            "score": r["score"],
+            "category": cat,
+            "feedback": r["feedback"],
+            "created_at": r["created_at"],
+        })
+    return result
+
+
+async def get_nps_overview(db: aiosqlite.Connection) -> dict:
+    """NPS overview: total, avg score, NPS score, category breakdown, per-segment, 6-month trend."""
+    rows = await db.execute_fetchall("SELECT * FROM nps_surveys ORDER BY created_at DESC")
+    total = len(rows)
+    if not total:
+        return {
+            "total_surveys": 0, "avg_score": 0.0, "nps_score": 0.0,
+            "promoters_pct": 0.0, "passives_pct": 0.0, "detractors_pct": 0.0,
+            "by_segment": [], "trend": [],
+        }
+
+    scores = [r["score"] for r in rows]
+    avg_score = round(sum(scores) / total, 1)
+    promoters = sum(1 for s in scores if s >= 9)
+    passives = sum(1 for s in scores if 7 <= s < 9)
+    detractors = sum(1 for s in scores if s < 7)
+    nps = round((promoters - detractors) / total * 100, 1)
+
+    # Per-segment breakdown
+    seg_rows = await db.execute_fetchall("""
+        SELECT c.segment, COUNT(*) as cnt, ROUND(AVG(n.score), 1) as avg,
+               SUM(CASE WHEN n.score >= 9 THEN 1 ELSE 0 END) as promo,
+               SUM(CASE WHEN n.score < 7 THEN 1 ELSE 0 END) as detract
+        FROM nps_surveys n JOIN customers c ON n.customer_id = c.id
+        GROUP BY c.segment ORDER BY avg DESC
+    """)
+    by_segment = []
+    for s in seg_rows:
+        seg_total = s["cnt"]
+        by_segment.append({
+            "segment": s["segment"],
+            "responses": seg_total,
+            "avg_score": s["avg"],
+            "nps_score": round((s["promo"] - s["detract"]) / seg_total * 100, 1) if seg_total else 0.0,
+        })
+
+    # Monthly trend (last 6 months)
+    six_months_ago = (datetime.utcnow() - timedelta(days=180)).isoformat()
+    trend_rows = await db.execute_fetchall(
+        "SELECT * FROM nps_surveys WHERE created_at >= ? ORDER BY created_at ASC",
+        (six_months_ago,),
+    )
+    monthly: dict[str, list[int]] = {}
+    for r in trend_rows:
+        month = r["created_at"][:7]  # YYYY-MM
+        monthly.setdefault(month, []).append(r["score"])
+    trend = []
+    for period, period_scores in sorted(monthly.items()):
+        cnt = len(period_scores)
+        p = sum(1 for s in period_scores if s >= 9)
+        d = sum(1 for s in period_scores if s < 7)
+        pa = cnt - p - d
+        trend.append({
+            "period": period,
+            "avg_score": round(sum(period_scores) / cnt, 1),
+            "promoters": p,
+            "passives": pa,
+            "detractors": d,
+            "responses": cnt,
+            "nps_score": round((p - d) / cnt * 100, 1),
+        })
+
+    return {
+        "total_surveys": total,
+        "avg_score": avg_score,
+        "nps_score": nps,
+        "promoters_pct": round(promoters / total * 100, 1),
+        "passives_pct": round(passives / total * 100, 1),
+        "detractors_pct": round(detractors / total * 100, 1),
+        "by_segment": by_segment,
+        "trend": trend,
+    }
+
+
+# ── Churn Risk Assessment ──────────────────────────────────────────────
+
+async def compute_churn_risk(db: aiosqlite.Connection, customer_id: int) -> dict | None:
+    """Compute churn risk score (0-100) based on multiple signals."""
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    factors = []
+    risk_score = 0
+
+    # Factor 1: Health score (0-30 points)
+    hs = customer["health_score"]
+    if hs < 30:
+        impact = 30
+        factors.append({"factor": "health_score", "impact": impact, "detail": f"Critical health score: {hs}"})
+    elif hs < 50:
+        impact = 20
+        factors.append({"factor": "health_score", "impact": impact, "detail": f"At-risk health score: {hs}"})
+    elif hs < 70:
+        impact = 10
+        factors.append({"factor": "health_score", "impact": impact, "detail": f"Neutral health score: {hs}"})
+    else:
+        impact = 0
+    risk_score += impact
+
+    # Factor 2: Renewal proximity without engagement (0-20 points)
+    if customer["renewal_date"]:
+        try:
+            renewal_dt = datetime.fromisoformat(customer["renewal_date"]).date()
+            days_until = (renewal_dt - datetime.utcnow().date()).days
+            if days_until <= 30:
+                impact = 20
+                factors.append({"factor": "renewal_imminent", "impact": impact,
+                                "detail": f"Renewal in {days_until} days"})
+            elif days_until <= 60:
+                impact = 10
+                factors.append({"factor": "renewal_approaching", "impact": impact,
+                                "detail": f"Renewal in {days_until} days"})
+            else:
+                impact = 0
+            risk_score += impact
+        except Exception:
+            pass
+
+    # Factor 3: Touchpoint frequency (0-20 points)
+    since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    tp_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM touchpoints WHERE customer_id = ? AND created_at >= ?",
+        (customer_id, since_30d),
+    )
+    tp_count = tp_rows[0]["cnt"] if tp_rows else 0
+    if tp_count == 0:
+        impact = 20
+        factors.append({"factor": "no_recent_touchpoints", "impact": impact,
+                        "detail": "No touchpoints in last 30 days"})
+    elif tp_count <= 1:
+        impact = 10
+        factors.append({"factor": "low_touchpoint_frequency", "impact": impact,
+                        "detail": f"Only {tp_count} touchpoint(s) in last 30 days"})
+    else:
+        impact = 0
+    risk_score += impact
+
+    # Factor 4: NPS trend (0-15 points)
+    nps_rows = await db.execute_fetchall(
+        "SELECT score FROM nps_surveys WHERE customer_id = ? ORDER BY created_at DESC LIMIT 3",
+        (customer_id,),
+    )
+    if nps_rows:
+        latest_nps = nps_rows[0]["score"]
+        if latest_nps < 7:
+            impact = 15
+            factors.append({"factor": "nps_detractor", "impact": impact,
+                            "detail": f"Latest NPS: {latest_nps} (detractor)"})
+        elif latest_nps < 9 and len(nps_rows) >= 2 and nps_rows[1]["score"] >= 9:
+            impact = 10
+            factors.append({"factor": "nps_declining", "impact": impact,
+                            "detail": f"NPS dropped from {nps_rows[1]['score']} to {latest_nps}"})
+        else:
+            impact = 0
+        risk_score += impact
+    else:
+        impact = 5
+        factors.append({"factor": "no_nps_data", "impact": impact,
+                        "detail": "No NPS survey data available"})
+        risk_score += impact
+
+    # Factor 5: Expansion activity (0-15 points)
+    try:
+        exp_rows = await db.execute_fetchall(
+            "SELECT stage FROM expansions WHERE customer_id = ? AND stage NOT IN ('won', 'lost')",
+            (customer_id,),
+        )
+        if not exp_rows:
+            impact = 5
+            factors.append({"factor": "no_expansion_activity", "impact": impact,
+                            "detail": "No active expansion opportunities"})
+            risk_score += impact
+        lost_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM expansions WHERE customer_id = ? AND stage = 'lost'",
+            (customer_id,),
+        )
+        if lost_rows and lost_rows[0]["cnt"] >= 2:
+            impact = 10
+            factors.append({"factor": "multiple_lost_expansions", "impact": impact,
+                            "detail": f"{lost_rows[0]['cnt']} lost expansion opportunities"})
+            risk_score += impact
+    except Exception:
+        pass  # expansions table may not exist yet
+
+    risk_score = min(100, risk_score)
+
+    # Risk level
+    if risk_score >= 70:
+        level = "critical"
+        rec = "Immediate intervention required: schedule executive sponsor call, offer incentives, review account strategy"
+    elif risk_score >= 50:
+        level = "high"
+        rec = "Schedule urgent CSM review, increase touchpoint frequency, address detractor feedback"
+    elif risk_score >= 30:
+        level = "medium"
+        rec = "Monitor closely, schedule proactive check-in, explore expansion opportunities"
+    else:
+        level = "low"
+        rec = "Continue regular cadence, look for expansion and advocacy opportunities"
+
+    return {
+        "customer_id": customer_id,
+        "customer_name": customer["name"],
+        "risk_score": risk_score,
+        "risk_level": level,
+        "factors": factors,
+        "recommendation": rec,
+    }
