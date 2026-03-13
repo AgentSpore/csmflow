@@ -18,7 +18,14 @@
 - **Expansion Tracking**: New `expansions` table (auto-migrated) with type (upsell/cross_sell/add_on), expected_mrr, 6-stage pipeline (identified → won/lost). Pipeline summary with total MRR.
 - **Team Performance**: Per-CSM metrics including customer count, MRR, avg health, at-risk count, champions (85+), touchpoint frequency (per customer), and retention rate from renewal history.
 
+### Cycle 7 (v0.7.0) — Customer Intelligence & Risk
+- **Customer Tags**: Flexible tagging system via `customer_tags` table. Add/remove tags per customer, filter by tag in customer listing. Tags returned in customer response as list.
+- **NPS Survey Tracking**: Record NPS scores (0-10), auto-categorize as promoter/passive/detractor. Overview endpoint with per-segment breakdown and 6-month trend analysis. Auto-triggers `nps_detractor` playbook when score < 7. NPS events included in customer timeline.
+- **Churn Risk Assessment**: Automated risk scoring (0-100) based on 5 factors: health score, renewal proximity, touchpoint frequency (last 30d), NPS trend (declining scores), and expansion activity. Risk levels: critical (>75), high (50-75), medium (25-50), low (<25). Per-factor breakdown with impact scores and actionable recommendations.
+
 ## Technical Notes
 - Expansions table created via runtime migration (_migrate_expansions)
-- Timeline combines 3 data sources with dict-based events
-- Team performance uses per-owner SQL aggregation with touchpoint frequency calculation
+- Tags and NPS tables created via runtime migration (_migrate_tags, _migrate_nps)
+- Timeline combines 4 data sources (touchpoints, QBRs, NPS surveys, lifecycle events)
+- Churn risk uses multi-factor scoring with configurable weights
+- NPS detractor playbook auto-trigger increments playbook.times_triggered
