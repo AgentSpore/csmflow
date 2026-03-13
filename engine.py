@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import io
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -124,6 +126,41 @@ async def init_db(path: str) -> aiosqlite.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_nps_customer ON nps_surveys(customer_id);
         CREATE INDEX IF NOT EXISTS idx_nps_date ON nps_surveys(created_at);
+    """)
+    # Migration: stakeholder contacts table
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            influence TEXT NOT NULL DEFAULT 'medium',
+            phone TEXT,
+            notes TEXT,
+            last_contacted_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(customer_id, email)
+        );
+        CREATE INDEX IF NOT EXISTS idx_contacts_customer ON contacts(customer_id);
+    """)
+    # Migration: customer goals table
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS customer_goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT,
+            target_date TEXT NOT NULL,
+            target_value REAL NOT NULL DEFAULT 100,
+            current_value REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            owner_email TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_goals_customer ON customer_goals(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_goals_status ON customer_goals(status);
     """)
     await db.commit()
     return db
@@ -329,6 +366,8 @@ async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
     await db.execute("DELETE FROM customer_tags WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM nps_surveys WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM touchpoints WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM contacts WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM customer_goals WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     await db.commit()
     return True
@@ -378,7 +417,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         return {"total_customers": 0, "total_mrr": 0.0, "avg_health_score": 0.0,
                 "at_risk_count": 0, "healthy_count": 0, "touchpoints_this_month": 0,
                 "upcoming_actions": 0, "renewals_next_30d": 0, "at_risk_renewal_value": 0.0,
-                "total_nps_surveys": 0, "avg_nps": 0.0}
+                "total_nps_surveys": 0, "avg_nps": 0.0,
+                "total_contacts": 0, "total_goals": 0}
     total_mrr = sum(r["mrr"] for r in customers)
     avg_health = round(sum(r["health_score"] for r in customers) / len(customers), 1)
     at_risk = sum(1 for r in customers if r["health_score"] < 50)
@@ -404,6 +444,9 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
     nps_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt, COALESCE(AVG(score), 0) as avg FROM nps_surveys")
     nps_total = nps_rows[0]["cnt"] if nps_rows else 0
     nps_avg = round(nps_rows[0]["avg"], 1) if nps_rows else 0.0
+    # Contacts & goals counts
+    contacts_count = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM contacts"))[0]["cnt"]
+    goals_count = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM customer_goals"))[0]["cnt"]
     return {
         "total_customers": len(customers),
         "total_mrr": round(total_mrr, 2),
@@ -416,6 +459,8 @@ async def get_csm_stats(db: aiosqlite.Connection) -> dict:
         "at_risk_renewal_value": round(at_risk_val, 2),
         "total_nps_surveys": nps_total,
         "avg_nps": nps_avg,
+        "total_contacts": contacts_count,
+        "total_goals": goals_count,
     }
 
 
@@ -641,9 +686,24 @@ async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
         events.append({
             "type": "nps_survey",
             "subtype": cat,
-            "summary": f"NPS survey: {n['score']}/10 ({cat}){' — ' + n['feedback'] if n['feedback'] else ''}",
+            "summary": f"NPS survey: {n['score']}/10 ({cat}){' -- ' + n['feedback'] if n['feedback'] else ''}",
             "outcome": "positive" if cat == "promoter" else ("negative" if cat == "detractor" else "neutral"),
             "timestamp": n["created_at"],
+        })
+
+    # Goal updates
+    goal_rows = await db.execute_fetchall(
+        "SELECT * FROM customer_goals WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for g in goal_rows:
+        progress = round(g["current_value"] / max(g["target_value"], 0.01) * 100, 1)
+        events.append({
+            "type": "goal",
+            "subtype": g["status"],
+            "summary": f"Goal \"{g['title']}\": {progress}% complete (target: {g['target_date']})",
+            "outcome": "positive" if g["status"] == "completed" else ("negative" if g["status"] == "at_risk" else "neutral"),
+            "timestamp": g["updated_at"],
         })
 
     # Customer creation
@@ -839,7 +899,7 @@ async def add_customer_tag(db: aiosqlite.Connection, customer_id: int, tag: str)
         )
         await db.commit()
     except Exception:
-        pass  # UNIQUE constraint — tag already exists, that's fine
+        pass  # UNIQUE constraint -- tag already exists, that's fine
     return await get_customer(db, customer_id)
 
 
@@ -1130,3 +1190,200 @@ async def compute_churn_risk(db: aiosqlite.Connection, customer_id: int) -> dict
         "factors": factors,
         "recommendation": rec,
     }
+
+
+# ── Stakeholder Contacts ────────────────────────────────────────────────
+
+def _contact_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"], "customer_id": r["customer_id"],
+        "name": r["name"], "email": r["email"],
+        "role": r["role"], "influence": r["influence"],
+        "phone": r["phone"], "notes": r["notes"],
+        "last_contacted_at": r["last_contacted_at"],
+        "created_at": r["created_at"],
+    }
+
+
+async def add_contact(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict | str:
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cur = await db.execute(
+            """INSERT INTO contacts (customer_id, name, email, role, influence, phone, notes, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (customer_id, data["name"], data["email"],
+             data.get("role", "user"), data.get("influence", "medium"),
+             data.get("phone"), data.get("notes"), now),
+        )
+        await db.commit()
+    except Exception:
+        return "duplicate_email"
+    rows = await db.execute_fetchall("SELECT * FROM contacts WHERE id = ?", (cur.lastrowid,))
+    return _contact_row(rows[0])
+
+
+async def list_contacts(db: aiosqlite.Connection, customer_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM contacts WHERE customer_id = ? ORDER BY influence DESC, name ASC",
+        (customer_id,),
+    )
+    return [_contact_row(r) for r in rows]
+
+
+async def update_contact_last_contacted(db: aiosqlite.Connection, contact_id: int) -> dict | None:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "UPDATE contacts SET last_contacted_at = ? WHERE id = ?", (now, contact_id),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    rows = await db.execute_fetchall("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+    return _contact_row(rows[0])
+
+
+async def delete_contact(db: aiosqlite.Connection, contact_id: int) -> bool:
+    cur = await db.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Customer Goals ──────────────────────────────────────────────────────
+
+def _goal_row(r: aiosqlite.Row) -> dict:
+    target = r["target_value"]
+    current = r["current_value"]
+    progress = round(current / max(target, 0.01) * 100, 1)
+    days_remaining = None
+    try:
+        target_dt = datetime.fromisoformat(r["target_date"]).date()
+        days_remaining = (target_dt - datetime.utcnow().date()).days
+    except Exception:
+        pass
+    return {
+        "id": r["id"], "customer_id": r["customer_id"],
+        "title": r["title"], "description": r["description"],
+        "target_date": r["target_date"],
+        "target_value": target, "current_value": current,
+        "progress_pct": min(progress, 100.0),
+        "status": r["status"],
+        "owner_email": r["owner_email"],
+        "days_remaining": days_remaining,
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+async def create_goal(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO customer_goals
+           (customer_id, title, description, target_date, target_value, current_value, owner_email, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (customer_id, data["title"], data.get("description"),
+         data["target_date"], data.get("target_value", 100),
+         data.get("current_value", 0), data.get("owner_email"), now, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM customer_goals WHERE id = ?", (cur.lastrowid,))
+    return _goal_row(rows[0])
+
+
+async def list_goals(db: aiosqlite.Connection, customer_id: int,
+                      status: str | None = None) -> list[dict]:
+    q = "SELECT * FROM customer_goals WHERE customer_id = ?"
+    params: list = [customer_id]
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    q += " ORDER BY target_date ASC"
+    rows = await db.execute_fetchall(q, params)
+    return [_goal_row(r) for r in rows]
+
+
+async def update_goal(db: aiosqlite.Connection, goal_id: int, updates: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM customer_goals WHERE id = ?", (goal_id,))
+    if not rows:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    sets = ["updated_at = ?"]
+    params: list = [now]
+    if updates.get("current_value") is not None:
+        sets.append("current_value = ?")
+        params.append(updates["current_value"])
+    if updates.get("status"):
+        sets.append("status = ?")
+        params.append(updates["status"])
+    if updates.get("notes"):
+        r = rows[0]
+        existing = r["description"] or ""
+        desc = f"{existing}\n[{now[:10]}] {updates['notes']}" if existing else f"[{now[:10]}] {updates['notes']}"
+        sets.append("description = ?")
+        params.append(desc)
+    params.append(goal_id)
+    await db.execute(f"UPDATE customer_goals SET {', '.join(sets)} WHERE id = ?", params)
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM customer_goals WHERE id = ?", (goal_id,))
+    return _goal_row(rows[0])
+
+
+async def get_at_risk_goals(db: aiosqlite.Connection) -> list[dict]:
+    """Goals that are past due or behind pace."""
+    today = datetime.utcnow().date().isoformat()
+    # Past due and not completed/cancelled
+    rows = await db.execute_fetchall("""
+        SELECT g.*, c.name as customer_name, c.company
+        FROM customer_goals g
+        JOIN customers c ON g.customer_id = c.id
+        WHERE g.status = 'active'
+          AND (g.target_date < ? OR g.current_value / MAX(g.target_value, 0.01) < 0.5)
+        ORDER BY g.target_date ASC
+    """, (today,))
+    result = []
+    for r in rows:
+        d = _goal_row(r)
+        d["customer_name"] = r["customer_name"]
+        d["company"] = r["company"]
+        # Check if actually at risk: past due OR behind pace
+        days_remaining = d.get("days_remaining")
+        progress = d["progress_pct"]
+        is_past_due = days_remaining is not None and days_remaining < 0
+        # Behind pace: less than 50% progress with less than 50% time remaining
+        total_days = None
+        try:
+            created_dt = datetime.fromisoformat(r["created_at"]).date()
+            target_dt = datetime.fromisoformat(r["target_date"]).date()
+            total_days = (target_dt - created_dt).days
+        except Exception:
+            pass
+        is_behind = False
+        if total_days and total_days > 0 and days_remaining is not None:
+            time_elapsed_pct = ((total_days - max(days_remaining, 0)) / total_days) * 100
+            if time_elapsed_pct > 50 and progress < time_elapsed_pct * 0.5:
+                is_behind = True
+        if is_past_due or is_behind:
+            result.append(d)
+    return result
+
+
+# ── Customer CSV Export ──────────────────────────────────────────────────
+
+async def export_customers_csv(db: aiosqlite.Connection, segment: str | None = None,
+                                health: str | None = None,
+                                plan: str | None = None) -> str:
+    customers = await list_customers(db, health, plan, segment)
+    buf = io.StringIO()
+    fieldnames = [
+        "id", "name", "company", "email", "plan", "mrr",
+        "health_score", "health_label", "segment", "owner_email",
+        "onboarded_at", "renewal_date", "contract_value",
+        "tags", "notes", "created_at",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for c in customers:
+        row = {k: c.get(k, "") for k in fieldnames}
+        if isinstance(row.get("tags"), list):
+            row["tags"] = ", ".join(row["tags"])
+        writer.writerow(row)
+    return buf.getvalue()
