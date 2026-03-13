@@ -358,3 +358,123 @@ class GoalResponse(BaseModel):
     days_remaining: Optional[int]
     created_at: str
     updated_at: str
+
+
+# ── Handoff / Transfer ─────────────────────────────────────────────────
+
+class HandoffCreate(BaseModel):
+    to_owner: str = Field(..., min_length=1, description="Email of the new CSM owner")
+    reason: str = Field(..., min_length=1, description="Reason for the handoff")
+    notes: Optional[str] = None
+
+
+class HandoffResponse(BaseModel):
+    id: int
+    customer_id: int
+    from_owner: Optional[str]
+    to_owner: str
+    reason: str
+    notes: Optional[str]
+    status: str  # pending | completed | cancelled
+    created_at: str
+    completed_at: Optional[str]
+
+
+class HandoffHistory(BaseModel):
+    customer_id: int
+    customer_name: str
+    total_handoffs: int
+    handoffs: list[HandoffResponse]
+
+
+# ── Customer Milestones ────────────────────────────────────────────────
+
+class MilestoneCreate(BaseModel):
+    milestone_type: str = Field(
+        ...,
+        description=(
+            "onboarding_complete | first_value | adoption_milestone | expansion_qualified | "
+            "renewal_signed | champion_identified | executive_sponsor | integration_complete"
+        ),
+    )
+    title: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class MilestoneResponse(BaseModel):
+    id: int
+    customer_id: int
+    milestone_type: str
+    title: str
+    notes: Optional[str]
+    achieved_at: str
+    created_by: Optional[str]
+
+
+class MilestoneTimeline(BaseModel):
+    customer_id: int
+    customer_name: str
+    total_possible: int
+    achieved: int
+    coverage_pct: float
+    milestones: list[MilestoneResponse]
+
+
+class MilestoneCoverage(BaseModel):
+    customer_id: int
+    customer_name: str
+    total_possible: int
+    achieved: int
+    coverage_pct: float
+    achieved_types: list[str]
+    missing_types: list[str]
+
+
+class MilestoneAnalytics(BaseModel):
+    total_customers: int
+    total_milestones_achieved: int
+    by_type: list[dict]  # [{type, count, pct_of_customers}]
+    most_achieved: Optional[str]
+    least_achieved: Optional[str]
+
+
+# ── Escalation Management ──────────────────────────────────────────────
+
+class EscalationCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    description: str = Field(..., min_length=1)
+    severity: str = Field(..., description="critical | high | medium | low")
+    category: str = Field(..., description="support | billing | executive | technical | legal")
+    assigned_to: Optional[str] = None
+    sla_hours: Optional[int] = Field(None, ge=1, description="SLA deadline in hours; defaults by severity")
+
+
+class EscalationUpdate(BaseModel):
+    status: Optional[str] = Field(None, description="open | investigating | pending_resolution | resolved | closed")
+    assigned_to: Optional[str] = None
+    resolution: Optional[str] = None
+
+
+class EscalationResponse(BaseModel):
+    id: int
+    customer_id: int
+    title: str
+    description: str
+    severity: str
+    category: str
+    assigned_to: Optional[str]
+    status: str
+    resolution: Optional[str]
+    created_at: str
+    updated_at: str
+    resolved_at: Optional[str]
+    sla_hours: int
+    is_sla_breached: bool
+
+
+class EscalationStats(BaseModel):
+    total: int
+    by_status: dict  # {open: N, investigating: N, ...}
+    by_severity: dict  # {critical: N, high: N, ...}
+    avg_resolution_hours: Optional[float]
+    sla_breach_rate: float  # 0-100%
