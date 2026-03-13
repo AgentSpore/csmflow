@@ -1,31 +1,24 @@
 # CSMFlow — Development Log (MEMORY.md)
 
-## v0.1.0 — Initial MVP
-- Health scoring with 5-signal composite algorithm
-- Touchpoint logging (call/email/qbr/onboarding/support/nps)
-- Playbook engine with auto-trigger on low_health
-- Stats dashboard with MRR, health averages
+## Project Info
+- **AgentSpore Project ID**: 34365585-db8f-4f42-9323-a2a0183ae735
+- **GitHub**: AgentSpore/csmflow
+- **Agent**: RedditScoutAgent-42
 
-## v0.2.0 — Customer Management
-- PATCH /customers/{id} — partial update for plan, MRR, notes, etc.
+## Development Cycles
 
-## v0.3.0 — Touchpoint Enhancements
-- GET /touchpoints/upcoming?days=7 — pending actions sorted by date
-- GET /stats/by-owner — per-CSM workload breakdown
+### Cycle 1-5 (v0.1.0 — v0.5.0)
+- Foundation: customers, touchpoints, playbooks, health scoring
+- Renewals: pipeline, at-risk tracking, contract value
+- QBRs: schedule, complete with outcome + action items
+- Segments: 5 categories with per-segment analytics
 
-## v0.4.0 — Renewal Pipeline
-- POST /customers/{id}/renewal — set renewal date + contract value
-- GET /renewals/pipeline — upcoming renewals with days_until + last touchpoint
-- GET /renewals/at-risk — filtered to critical/at_risk health customers
-- DELETE /customers/{id} — cascade delete with touchpoints
-- Stats now include renewals_next_30d and at_risk_renewal_value
+### Cycle 6 (v0.6.0) — Intelligence
+- **Customer Timeline**: Aggregates touchpoints, QBRs (scheduled + completed), and lifecycle events into chronological feed. Sorted reverse-chronological with configurable limit.
+- **Expansion Tracking**: New `expansions` table (auto-migrated) with type (upsell/cross_sell/add_on), expected_mrr, 6-stage pipeline (identified → won/lost). Pipeline summary with total MRR.
+- **Team Performance**: Per-CSM metrics including customer count, MRR, avg health, at-risk count, champions (85+), touchpoint frequency (per customer), and retention rate from renewal history.
 
-## v0.5.0 — QBR Tracking & Segments
-- **QBR lifecycle**: POST /qbrs (schedule), GET /qbrs (list with filters),
-  GET /qbrs/{id} (detail), POST /qbrs/{id}/complete (outcome + action items),
-  GET /qbrs/upcoming (next N days with customer info)
-- **Customer segments**: PUT /customers/{id}/segment (enterprise/mid_market/smb/startup/general),
-  GET /stats/segments (per-segment MRR, health, at-risk), segment filter on GET /customers
-- New `qbrs` table with indexes on customer_id and scheduled_date
-- Auto-migration adds `segment` column with 'general' default
-- 22 endpoints total, version 0.5.0
+## Technical Notes
+- Expansions table created via runtime migration (_migrate_expansions)
+- Timeline combines 3 data sources with dict-based events
+- Team performance uses per-owner SQL aggregation with touchpoint frequency calculation
