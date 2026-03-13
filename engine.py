@@ -42,6 +42,22 @@ CREATE TABLE IF NOT EXISTS playbooks (
     times_triggered INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS qbrs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    scheduled_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    attendees TEXT NOT NULL DEFAULT '[]',
+    agenda TEXT,
+    outcome TEXT,
+    action_items TEXT NOT NULL DEFAULT '[]',
+    completed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qbrs_customer ON qbrs(customer_id);
+CREATE INDEX IF NOT EXISTS idx_qbrs_date ON qbrs(scheduled_date);
 """
 
 MIGRATION_RENEWAL = """
@@ -80,6 +96,11 @@ async def init_db(path: str) -> aiosqlite.Connection:
                     await db.execute(stmt)
                 except Exception:
                     pass
+    # Migration: add segment column
+    try:
+        await db.execute("SELECT segment FROM customers LIMIT 1")
+    except Exception:
+        await db.execute("ALTER TABLE customers ADD COLUMN segment TEXT NOT NULL DEFAULT 'general'")
     await db.commit()
     return db
 
@@ -99,6 +120,7 @@ def _customer_row(r: aiosqlite.Row) -> dict:
         "owner_email": r["owner_email"], "onboarded_at": r["onboarded_at"],
         "days_since_onboarding": days,
         "renewal_date": r["renewal_date"], "contract_value": r["contract_value"],
+        "segment": r["segment"] if "segment" in r.keys() else "general",
         "notes": r["notes"], "created_at": r["created_at"],
     }
 
@@ -152,11 +174,13 @@ async def create_customer(db: aiosqlite.Connection, data: dict) -> dict:
     return _customer_row(rows[0])
 
 
-async def list_customers(db: aiosqlite.Connection, health: str | None = None, plan: str | None = None) -> list[dict]:
+async def list_customers(db: aiosqlite.Connection, health: str | None = None, plan: str | None = None, segment: str | None = None) -> list[dict]:
     q = "SELECT * FROM customers"
     conds, params = [], []
     if plan:
         conds.append("plan = ?"); params.append(plan)
+    if segment:
+        conds.append("segment = ?"); params.append(segment)
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY mrr DESC"
@@ -402,3 +426,108 @@ async def get_stats_by_owner(db: aiosqlite.Connection) -> list[dict]:
             "touchpoints_last_30d": tp_count,
         })
     return result
+
+
+
+# ── QBR Tracking ─────────────────────────────────────────────────────────
+
+def _qbr_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"], "customer_id": r["customer_id"],
+        "scheduled_date": r["scheduled_date"],
+        "status": r["status"],
+        "attendees": json.loads(r["attendees"]) if r["attendees"] else [],
+        "agenda": r["agenda"],
+        "outcome": r["outcome"],
+        "action_items": json.loads(r["action_items"]) if r["action_items"] else [],
+        "completed_at": r["completed_at"],
+        "created_at": r["created_at"],
+    }
+
+
+async def create_qbr(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO qbrs (customer_id, scheduled_date, attendees, agenda, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (data["customer_id"], data["scheduled_date"],
+         json.dumps(data.get("attendees", [])), data.get("agenda"), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM qbrs WHERE id = ?", (cur.lastrowid,))
+    return _qbr_row(rows[0])
+
+
+async def list_qbrs(db: aiosqlite.Connection, customer_id: int | None = None,
+                     status: str | None = None) -> list[dict]:
+    q = "SELECT * FROM qbrs WHERE 1=1"
+    params: list = []
+    if customer_id:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    q += " ORDER BY scheduled_date DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_qbr_row(r) for r in rows]
+
+
+async def get_qbr(db: aiosqlite.Connection, qbr_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM qbrs WHERE id = ?", (qbr_id,))
+    return _qbr_row(rows[0]) if rows else None
+
+
+async def complete_qbr(db: aiosqlite.Connection, qbr_id: int, outcome: str,
+                        action_items: list[str]) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM qbrs WHERE id = ?", (qbr_id,))
+    if not rows:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE qbrs SET status = 'completed', outcome = ?, action_items = ?, completed_at = ? WHERE id = ?",
+        (outcome, json.dumps(action_items), now, qbr_id),
+    )
+    await db.commit()
+    return await get_qbr(db, qbr_id)
+
+
+async def get_upcoming_qbrs(db: aiosqlite.Connection, days: int = 30) -> list[dict]:
+    today = datetime.utcnow().date().isoformat()
+    until = (datetime.utcnow().date() + timedelta(days=days)).isoformat()
+    rows = await db.execute_fetchall(
+        """SELECT q.*, c.name as customer_name, c.company, c.health_score
+           FROM qbrs q JOIN customers c ON q.customer_id = c.id
+           WHERE q.status = 'scheduled' AND q.scheduled_date >= ? AND q.scheduled_date <= ?
+           ORDER BY q.scheduled_date ASC""",
+        (today, until),
+    )
+    result = []
+    for r in rows:
+        d = _qbr_row(r)
+        d["customer_name"] = r["customer_name"]
+        d["company"] = r["company"]
+        d["health_score"] = r["health_score"]
+        result.append(d)
+    return result
+
+
+# ── Segments ─────────────────────────────────────────────────────────────
+
+async def set_customer_segment(db: aiosqlite.Connection, customer_id: int, segment: str) -> dict | None:
+    cur = await db.execute("UPDATE customers SET segment = ? WHERE id = ?", (segment, customer_id))
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_customer(db, customer_id)
+
+
+async def get_segment_stats(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("""
+        SELECT segment, COUNT(*) as count, ROUND(SUM(mrr), 2) as total_mrr,
+               ROUND(AVG(health_score), 1) as avg_health,
+               SUM(CASE WHEN health_score < 50 THEN 1 ELSE 0 END) as at_risk
+        FROM customers GROUP BY segment ORDER BY total_mrr DESC
+    """)
+    return [{"segment": r["segment"], "customers": r["count"], "total_mrr": r["total_mrr"],
+             "avg_health_score": r["avg_health"], "at_risk_count": r["at_risk"]} for r in rows]
