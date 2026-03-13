@@ -245,6 +245,87 @@ async def init_db(path: str) -> aiosqlite.Connection:
         CREATE INDEX IF NOT EXISTS idx_escalations_severity ON escalations(severity);
         CREATE INDEX IF NOT EXISTS idx_escalations_category ON escalations(category);
     """)
+    # Migration: health_alerts + health_alert_log tables (v1.0.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS health_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            condition_type TEXT NOT NULL,
+            threshold REAL NOT NULL,
+            notification_email TEXT,
+            is_enabled INTEGER DEFAULT 1,
+            times_triggered INTEGER DEFAULT 0,
+            last_triggered_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS health_alert_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER REFERENCES health_alerts(id) ON DELETE CASCADE,
+            customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+            customer_name TEXT,
+            alert_name TEXT,
+            condition_type TEXT,
+            threshold REAL,
+            actual_value REAL,
+            message TEXT,
+            is_acknowledged INTEGER DEFAULT 0,
+            triggered_at TEXT NOT NULL,
+            acknowledged_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_alert_log_alert ON health_alert_log(alert_id);
+        CREATE INDEX IF NOT EXISTS idx_alert_log_customer ON health_alert_log(customer_id);
+    """)
+    # Migration: success_plans + plan_tasks tables (v1.0.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS success_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT,
+            owner_email TEXT,
+            status TEXT DEFAULT 'draft',
+            start_date TEXT,
+            target_date TEXT,
+            progress_pct REAL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_plans_customer ON success_plans(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_plans_status ON success_plans(status);
+        CREATE TABLE IF NOT EXISTS plan_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL REFERENCES success_plans(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT,
+            assignee_email TEXT,
+            status TEXT DEFAULT 'pending',
+            priority TEXT DEFAULT 'medium',
+            due_date TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_plan_tasks_plan ON plan_tasks(plan_id);
+        CREATE INDEX IF NOT EXISTS idx_plan_tasks_status ON plan_tasks(status);
+    """)
+    # Migration: customer_feedback table (v1.0.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS customer_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            priority TEXT DEFAULT 'medium',
+            status TEXT DEFAULT 'new',
+            submitted_by TEXT,
+            votes INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feedback_customer ON customer_feedback(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_feedback_type ON customer_feedback(type);
+        CREATE INDEX IF NOT EXISTS idx_feedback_status ON customer_feedback(status);
+    """)
     await db.commit()
     return db
 
@@ -381,6 +462,7 @@ async def update_health(db: aiosqlite.Connection, customer_id: int,
     label = _health_label(score)
     if label in ("critical", "at_risk"):
         await _trigger_playbooks(db, customer_id, "low_health")
+    await evaluate_health_alerts(db, customer_id)
     return await get_customer(db, customer_id)
 
 
@@ -454,6 +536,11 @@ async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
     await db.execute("DELETE FROM handoffs WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM milestones WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM escalations WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM health_alert_log WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM customer_feedback WHERE customer_id = ?", (customer_id,))
+    for sp in await db.execute_fetchall("SELECT id FROM success_plans WHERE customer_id = ?", (customer_id,)):
+        await db.execute("DELETE FROM plan_tasks WHERE plan_id = ?", (sp["id"],))
+    await db.execute("DELETE FROM success_plans WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     await db.commit()
     return True
@@ -843,6 +930,23 @@ async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
             "outcome": "positive" if h["status"] == "completed" else "neutral",
             "timestamp": h["completed_at"] or h["created_at"],
         })
+
+    # Feedback (v1.0.0)
+    try:
+        fb_rows = await db.execute_fetchall(
+            "SELECT * FROM customer_feedback WHERE customer_id = ? ORDER BY created_at DESC",
+            (customer_id,),
+        )
+        for fb in fb_rows:
+            events.append({
+                "type": "feedback",
+                "subtype": fb["type"],
+                "summary": f"Feedback [{fb['type']}]: {fb['title']} (priority: {fb['priority']}, status: {fb['status']})",
+                "outcome": "negative" if fb["priority"] in ("high", "critical") else "neutral",
+                "timestamp": fb["created_at"],
+            })
+    except Exception:
+        pass
 
     # Customer creation
     events.append({
@@ -2026,4 +2130,556 @@ async def get_escalation_stats(db: aiosqlite.Connection) -> dict:
         "by_severity": by_severity,
         "avg_resolution_hours": avg_resolution,
         "sla_breach_rate": sla_breach_rate,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Health Alerts (v1.0.0) ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _health_alert_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "condition_type": r["condition_type"],
+        "threshold": r["threshold"],
+        "notification_email": r["notification_email"],
+        "is_enabled": bool(r["is_enabled"]),
+        "times_triggered": r["times_triggered"],
+        "last_triggered_at": r["last_triggered_at"],
+        "created_at": r["created_at"],
+    }
+
+
+def _alert_log_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "alert_id": r["alert_id"],
+        "customer_id": r["customer_id"],
+        "customer_name": r["customer_name"],
+        "alert_name": r["alert_name"],
+        "condition_type": r["condition_type"],
+        "threshold": r["threshold"],
+        "actual_value": r["actual_value"],
+        "message": r["message"],
+        "is_acknowledged": bool(r["is_acknowledged"]),
+        "triggered_at": r["triggered_at"],
+        "acknowledged_at": r["acknowledged_at"],
+    }
+
+
+async def create_health_alert(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO health_alerts (name, condition_type, threshold, notification_email, is_enabled, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (data["name"], data["condition_type"], data["threshold"],
+         data.get("notification_email"), 1 if data.get("is_enabled", True) else 0, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM health_alerts WHERE id = ?", (cur.lastrowid,))
+    return _health_alert_row(rows[0])
+
+
+async def list_health_alerts(db: aiosqlite.Connection, is_enabled: bool | None = None) -> list[dict]:
+    q = "SELECT * FROM health_alerts WHERE 1=1"
+    params: list = []
+    if is_enabled is not None:
+        q += " AND is_enabled = ?"
+        params.append(1 if is_enabled else 0)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_health_alert_row(r) for r in rows]
+
+
+async def get_health_alert(db: aiosqlite.Connection, alert_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM health_alerts WHERE id = ?", (alert_id,))
+    return _health_alert_row(rows[0]) if rows else None
+
+
+async def update_health_alert(db: aiosqlite.Connection, alert_id: int, updates: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM health_alerts WHERE id = ?", (alert_id,))
+    if not rows:
+        return None
+    fields = {}
+    for k in ("name", "condition_type", "threshold", "notification_email"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    if "is_enabled" in updates:
+        fields["is_enabled"] = 1 if updates["is_enabled"] else 0
+    if not fields:
+        return _health_alert_row(rows[0])
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [alert_id]
+    await db.execute(f"UPDATE health_alerts SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    return await get_health_alert(db, alert_id)
+
+
+async def delete_health_alert(db: aiosqlite.Connection, alert_id: int) -> bool:
+    cur = await db.execute("DELETE FROM health_alerts WHERE id = ?", (alert_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def evaluate_health_alerts(db: aiosqlite.Connection, customer_id: int) -> list[dict]:
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return []
+    alerts = await db.execute_fetchall(
+        "SELECT * FROM health_alerts WHERE is_enabled = 1")
+    fired = []
+    now = _now()
+    for a in alerts:
+        condition = a["condition_type"]
+        threshold = a["threshold"]
+        actual_value = None
+        message = None
+        violated = False
+
+        if condition == "health_below":
+            actual_value = float(customer["health_score"])
+            if actual_value < threshold:
+                violated = True
+                message = f"Health score {actual_value} is below threshold {threshold}"
+
+        elif condition == "health_drop":
+            message = "health_drop check not implemented"
+
+        elif condition == "churn_risk_above":
+            risk = await compute_churn_risk(db, customer_id)
+            if risk:
+                actual_value = float(risk["risk_score"])
+                if actual_value > threshold:
+                    violated = True
+                    message = f"Churn risk {actual_value} exceeds threshold {threshold}"
+
+        elif condition == "no_touchpoint_days":
+            tp_rows = await db.execute_fetchall(
+                "SELECT MAX(created_at) as last_tp FROM touchpoints WHERE customer_id = ?",
+                (customer_id,),
+            )
+            if tp_rows and tp_rows[0]["last_tp"]:
+                try:
+                    last_dt = datetime.fromisoformat(tp_rows[0]["last_tp"])
+                    days_since = (datetime.now(timezone.utc) - last_dt).days
+                    actual_value = float(days_since)
+                    if actual_value > threshold:
+                        violated = True
+                        message = f"No touchpoint for {days_since} days (threshold: {threshold})"
+                except Exception:
+                    pass
+            else:
+                actual_value = 9999.0
+                violated = True
+                message = f"No touchpoints ever recorded (threshold: {threshold} days)"
+
+        if violated and message:
+            cur = await db.execute(
+                """INSERT INTO health_alert_log
+                   (alert_id, customer_id, customer_name, alert_name, condition_type, threshold, actual_value, message, triggered_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (a["id"], customer_id, customer["name"], a["name"],
+                 condition, threshold, actual_value, message, now),
+            )
+            await db.execute(
+                "UPDATE health_alerts SET times_triggered = times_triggered + 1, last_triggered_at = ? WHERE id = ?",
+                (now, a["id"]),
+            )
+            await db.commit()
+            log_rows = await db.execute_fetchall(
+                "SELECT * FROM health_alert_log WHERE id = ?", (cur.lastrowid,))
+            fired.append(_alert_log_row(log_rows[0]))
+
+    return fired
+
+
+async def list_alert_log(db: aiosqlite.Connection,
+                          alert_id: int | None = None,
+                          customer_id: int | None = None,
+                          acknowledged: bool | None = None,
+                          limit: int = 50) -> list[dict]:
+    q = "SELECT * FROM health_alert_log WHERE 1=1"
+    params: list = []
+    if alert_id is not None:
+        q += " AND alert_id = ?"
+        params.append(alert_id)
+    if customer_id is not None:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if acknowledged is not None:
+        q += " AND is_acknowledged = ?"
+        params.append(1 if acknowledged else 0)
+    q += " ORDER BY triggered_at DESC LIMIT ?"
+    params.append(limit)
+    rows = await db.execute_fetchall(q, params)
+    return [_alert_log_row(r) for r in rows]
+
+
+async def acknowledge_alert(db: aiosqlite.Connection, log_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM health_alert_log WHERE id = ?", (log_id,))
+    if not rows:
+        return None
+    now = _now()
+    await db.execute(
+        "UPDATE health_alert_log SET is_acknowledged = 1, acknowledged_at = ? WHERE id = ?",
+        (now, log_id),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM health_alert_log WHERE id = ?", (log_id,))
+    return _alert_log_row(rows[0])
+
+
+async def get_alert_summary(db: aiosqlite.Connection) -> dict:
+    total_alerts = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM health_alerts")
+    enabled_alerts = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM health_alerts WHERE is_enabled = 1")
+    total_log = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM health_alert_log")
+    unack = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM health_alert_log WHERE is_acknowledged = 0")
+    by_type = await db.execute_fetchall("""
+        SELECT condition_type, COUNT(*) as cnt
+        FROM health_alert_log GROUP BY condition_type ORDER BY cnt DESC
+    """)
+    recent = await db.execute_fetchall(
+        "SELECT * FROM health_alert_log ORDER BY triggered_at DESC LIMIT 5")
+    return {
+        "total_alerts": total_alerts[0]["cnt"],
+        "enabled_alerts": enabled_alerts[0]["cnt"],
+        "total_triggered": total_log[0]["cnt"],
+        "unacknowledged": unack[0]["cnt"],
+        "by_condition_type": {r["condition_type"]: r["cnt"] for r in by_type},
+        "recent_triggers": [_alert_log_row(r) for r in recent],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Success Plans (v1.0.0) ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _success_plan_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "title": r["title"],
+        "description": r["description"],
+        "owner_email": r["owner_email"],
+        "status": r["status"],
+        "start_date": r["start_date"],
+        "target_date": r["target_date"],
+        "progress_pct": r["progress_pct"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+def _plan_task_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "plan_id": r["plan_id"],
+        "title": r["title"],
+        "description": r["description"],
+        "assignee_email": r["assignee_email"],
+        "status": r["status"],
+        "priority": r["priority"],
+        "due_date": r["due_date"],
+        "completed_at": r["completed_at"],
+        "created_at": r["created_at"],
+    }
+
+
+async def create_success_plan(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO success_plans
+           (customer_id, title, description, owner_email, status, start_date, target_date, progress_pct, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data["customer_id"], data["title"], data.get("description"),
+         data.get("owner_email"), data.get("status", "draft"),
+         data.get("start_date"), data.get("target_date"), 0, now, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM success_plans WHERE id = ?", (cur.lastrowid,))
+    return _success_plan_row(rows[0])
+
+
+async def list_success_plans(db: aiosqlite.Connection,
+                               customer_id: int | None = None,
+                               status: str | None = None) -> list[dict]:
+    q = "SELECT * FROM success_plans WHERE 1=1"
+    params: list = []
+    if customer_id is not None:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_success_plan_row(r) for r in rows]
+
+
+async def get_success_plan(db: aiosqlite.Connection, plan_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM success_plans WHERE id = ?", (plan_id,))
+    if not rows:
+        return None
+    d = _success_plan_row(rows[0])
+    task_total = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM plan_tasks WHERE plan_id = ?", (plan_id,))
+    task_completed = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM plan_tasks WHERE plan_id = ? AND status = 'completed'", (plan_id,))
+    d["tasks_total"] = task_total[0]["cnt"]
+    d["tasks_completed"] = task_completed[0]["cnt"]
+    return d
+
+
+async def update_success_plan(db: aiosqlite.Connection, plan_id: int, updates: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM success_plans WHERE id = ?", (plan_id,))
+    if not rows:
+        return None
+    now = _now()
+    fields = {"updated_at": now}
+    for k in ("title", "description", "owner_email", "status", "start_date", "target_date"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    if "progress_pct" in updates and updates["progress_pct"] is not None:
+        fields["progress_pct"] = updates["progress_pct"]
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [plan_id]
+    await db.execute(f"UPDATE success_plans SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    return await get_success_plan(db, plan_id)
+
+
+async def delete_success_plan(db: aiosqlite.Connection, plan_id: int) -> bool:
+    await db.execute("DELETE FROM plan_tasks WHERE plan_id = ?", (plan_id,))
+    cur = await db.execute("DELETE FROM success_plans WHERE id = ?", (plan_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def add_plan_task(db: aiosqlite.Connection, plan_id: int, data: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM success_plans WHERE id = ?", (plan_id,))
+    if not rows:
+        return None
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO plan_tasks (plan_id, title, description, assignee_email, status, priority, due_date, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (plan_id, data["title"], data.get("description"),
+         data.get("assignee_email"), data.get("status", "pending"),
+         data.get("priority", "medium"), data.get("due_date"), now),
+    )
+    await db.commit()
+    task_rows = await db.execute_fetchall("SELECT * FROM plan_tasks WHERE id = ?", (cur.lastrowid,))
+    return _plan_task_row(task_rows[0])
+
+
+async def list_plan_tasks(db: aiosqlite.Connection, plan_id: int,
+                            status: str | None = None) -> list[dict]:
+    q = "SELECT * FROM plan_tasks WHERE plan_id = ?"
+    params: list = [plan_id]
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    q += " ORDER BY created_at ASC"
+    rows = await db.execute_fetchall(q, params)
+    return [_plan_task_row(r) for r in rows]
+
+
+async def _recalc_plan_progress(db: aiosqlite.Connection, plan_id: int):
+    total = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM plan_tasks WHERE plan_id = ?", (plan_id,))
+    completed = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM plan_tasks WHERE plan_id = ? AND status = 'completed'", (plan_id,))
+    t = total[0]["cnt"]
+    c = completed[0]["cnt"]
+    pct = round(c / max(t, 1) * 100, 1)
+    now = _now()
+    await db.execute(
+        "UPDATE success_plans SET progress_pct = ?, updated_at = ? WHERE id = ?",
+        (pct, now, plan_id),
+    )
+    await db.commit()
+
+
+async def update_plan_task(db: aiosqlite.Connection, task_id: int, updates: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM plan_tasks WHERE id = ?", (task_id,))
+    if not rows:
+        return None
+    task = rows[0]
+    fields: dict = {}
+    for k in ("title", "description", "assignee_email", "status", "priority", "due_date"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    new_status = fields.get("status")
+    if new_status == "completed" and task["status"] != "completed":
+        fields["completed_at"] = _now()
+    elif new_status and new_status != "completed":
+        fields["completed_at"] = None
+    if not fields:
+        return _plan_task_row(task)
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [task_id]
+    await db.execute(f"UPDATE plan_tasks SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    await _recalc_plan_progress(db, task["plan_id"])
+    rows = await db.execute_fetchall("SELECT * FROM plan_tasks WHERE id = ?", (task_id,))
+    return _plan_task_row(rows[0])
+
+
+async def delete_plan_task(db: aiosqlite.Connection, task_id: int) -> bool:
+    rows = await db.execute_fetchall("SELECT * FROM plan_tasks WHERE id = ?", (task_id,))
+    if not rows:
+        return False
+    plan_id = rows[0]["plan_id"]
+    await db.execute("DELETE FROM plan_tasks WHERE id = ?", (task_id,))
+    await db.commit()
+    await _recalc_plan_progress(db, plan_id)
+    return True
+
+
+async def get_plan_overview(db: aiosqlite.Connection) -> dict:
+    total = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM success_plans")
+    by_status = await db.execute_fetchall(
+        "SELECT status, COUNT(*) as cnt FROM success_plans GROUP BY status ORDER BY cnt DESC")
+    avg_progress = await db.execute_fetchall(
+        "SELECT COALESCE(AVG(progress_pct), 0) as avg FROM success_plans")
+    total_tasks = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM plan_tasks")
+    completed_tasks = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM plan_tasks WHERE status = 'completed'")
+    overdue = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM success_plans WHERE target_date < ? AND status NOT IN ('completed', 'cancelled')",
+        (datetime.utcnow().date().isoformat(),))
+    return {
+        "total_plans": total[0]["cnt"],
+        "by_status": {r["status"]: r["cnt"] for r in by_status},
+        "avg_progress_pct": round(avg_progress[0]["avg"], 1),
+        "total_tasks": total_tasks[0]["cnt"],
+        "completed_tasks": completed_tasks[0]["cnt"],
+        "overdue_plans": overdue[0]["cnt"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Customer Feedback (v1.0.0) ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _feedback_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "type": r["type"],
+        "title": r["title"],
+        "description": r["description"],
+        "priority": r["priority"],
+        "status": r["status"],
+        "submitted_by": r["submitted_by"],
+        "votes": r["votes"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+async def create_feedback(db: aiosqlite.Connection, data: dict) -> dict | None:
+    customer = await get_customer(db, data["customer_id"])
+    if not customer:
+        return None
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO customer_feedback
+           (customer_id, type, title, description, priority, status, submitted_by, votes, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data["customer_id"], data["type"], data["title"], data.get("description"),
+         data.get("priority", "medium"), data.get("status", "new"),
+         data.get("submitted_by"), data.get("votes", 1), now, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM customer_feedback WHERE id = ?", (cur.lastrowid,))
+    return _feedback_row(rows[0])
+
+
+async def list_feedback(db: aiosqlite.Connection,
+                          customer_id: int | None = None,
+                          type: str | None = None,
+                          status: str | None = None,
+                          priority: str | None = None,
+                          limit: int = 50) -> list[dict]:
+    q = "SELECT * FROM customer_feedback WHERE 1=1"
+    params: list = []
+    if customer_id is not None:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if type:
+        q += " AND type = ?"
+        params.append(type)
+    if status:
+        q += " AND status = ?"
+        params.append(status)
+    if priority:
+        q += " AND priority = ?"
+        params.append(priority)
+    q += " ORDER BY votes DESC, created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = await db.execute_fetchall(q, params)
+    return [_feedback_row(r) for r in rows]
+
+
+async def get_feedback(db: aiosqlite.Connection, feedback_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM customer_feedback WHERE id = ?", (feedback_id,))
+    return _feedback_row(rows[0]) if rows else None
+
+
+async def update_feedback(db: aiosqlite.Connection, feedback_id: int, updates: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM customer_feedback WHERE id = ?", (feedback_id,))
+    if not rows:
+        return None
+    now = _now()
+    fields = {"updated_at": now}
+    for k in ("type", "title", "description", "priority", "status", "submitted_by"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [feedback_id]
+    await db.execute(f"UPDATE customer_feedback SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    return await get_feedback(db, feedback_id)
+
+
+async def delete_feedback(db: aiosqlite.Connection, feedback_id: int) -> bool:
+    cur = await db.execute("DELETE FROM customer_feedback WHERE id = ?", (feedback_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def vote_feedback(db: aiosqlite.Connection, feedback_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM customer_feedback WHERE id = ?", (feedback_id,))
+    if not rows:
+        return None
+    now = _now()
+    await db.execute(
+        "UPDATE customer_feedback SET votes = votes + 1, updated_at = ? WHERE id = ?",
+        (now, feedback_id),
+    )
+    await db.commit()
+    return await get_feedback(db, feedback_id)
+
+
+async def get_feedback_stats(db: aiosqlite.Connection) -> dict:
+    total = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM customer_feedback")
+    by_type = await db.execute_fetchall(
+        "SELECT type, COUNT(*) as cnt FROM customer_feedback GROUP BY type ORDER BY cnt DESC")
+    by_status = await db.execute_fetchall(
+        "SELECT status, COUNT(*) as cnt FROM customer_feedback GROUP BY status ORDER BY cnt DESC")
+    by_priority = await db.execute_fetchall(
+        "SELECT priority, COUNT(*) as cnt FROM customer_feedback GROUP BY priority ORDER BY cnt DESC")
+    top_voted = await db.execute_fetchall(
+        "SELECT * FROM customer_feedback ORDER BY votes DESC LIMIT 5")
+    total_votes = await db.execute_fetchall(
+        "SELECT COALESCE(SUM(votes), 0) as total FROM customer_feedback")
+    return {
+        "total_feedback": total[0]["cnt"],
+        "by_type": {r["type"]: r["cnt"] for r in by_type},
+        "by_status": {r["status"]: r["cnt"] for r in by_status},
+        "by_priority": {r["priority"]: r["cnt"] for r in by_priority},
+        "total_votes": total_votes[0]["total"],
+        "top_voted": [_feedback_row(r) for r in top_voted],
     }
