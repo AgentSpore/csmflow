@@ -163,6 +163,8 @@ class CSMStats(BaseModel):
     at_risk_renewal_value: float
     total_nps_surveys: int
     avg_nps: float
+    total_contacts: int
+    total_goals: int
 
 
 # ── Timeline ────────────────────────────────────────────────────────────
@@ -299,3 +301,60 @@ class ChurnRisk(BaseModel):
     risk_level: str  # critical | high | medium | low
     factors: list[ChurnRiskFactor]
     recommendation: str
+
+
+# ── Stakeholder Contacts ────────────────────────────────────────────────
+
+class ContactCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=200)
+    role: str = Field("user", description="champion | decision_maker | influencer | user | technical")
+    influence: str = Field("medium", description="high | medium | low")
+    phone: Optional[str] = Field(None, max_length=30)
+    notes: Optional[str] = None
+
+
+class ContactResponse(BaseModel):
+    id: int
+    customer_id: int
+    name: str
+    email: str
+    role: str
+    influence: str
+    phone: Optional[str]
+    notes: Optional[str]
+    last_contacted_at: Optional[str]
+    created_at: str
+
+
+# ── Customer Goals ──────────────────────────────────────────────────────
+
+class GoalCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: Optional[str] = None
+    target_date: str = Field(..., description="ISO date YYYY-MM-DD")
+    target_value: float = Field(100, ge=0, description="Target metric value")
+    current_value: float = Field(0, ge=0, description="Current metric value")
+    owner_email: Optional[str] = None
+
+
+class GoalUpdate(BaseModel):
+    current_value: Optional[float] = Field(None, ge=0)
+    status: Optional[str] = Field(None, description="active | completed | at_risk | cancelled")
+    notes: Optional[str] = None
+
+
+class GoalResponse(BaseModel):
+    id: int
+    customer_id: int
+    title: str
+    description: Optional[str]
+    target_date: str
+    target_value: float
+    current_value: float
+    progress_pct: float
+    status: str
+    owner_email: Optional[str]
+    days_remaining: Optional[int]
+    created_at: str
+    updated_at: str
