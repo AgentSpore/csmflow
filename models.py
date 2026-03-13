@@ -110,7 +110,7 @@ class HealthScoreUpdate(BaseModel):
     days_to_value: Optional[int] = Field(None, description="Days to first key milestone")
 
 
-# ── QBR Models ───────────────────────────────────────────────────────────
+# -- QBR Models -----------------------------------------------------------
 
 class QBRCreate(BaseModel):
     customer_id: int
@@ -137,7 +137,7 @@ class QBRResponse(BaseModel):
     created_at: str
 
 
-# ── Segment Models ───────────────────────────────────────────────────────
+# -- Segment Models --------------------------------------------------------
 
 class SegmentUpdate(BaseModel):
     segment: str = Field(..., description="Segment: enterprise | mid_market | smb | startup | general")
@@ -167,7 +167,7 @@ class CSMStats(BaseModel):
     total_goals: int
 
 
-# ── Timeline ────────────────────────────────────────────────────────────
+# -- Timeline --------------------------------------------------------------
 
 class TimelineEvent(BaseModel):
     type: str
@@ -185,7 +185,7 @@ class CustomerTimeline(BaseModel):
     events: list[TimelineEvent]
 
 
-# ── Expansion ───────────────────────────────────────────────────────────
+# -- Expansion -------------------------------------------------------------
 
 class ExpansionCreate(BaseModel):
     customer_id: int
@@ -227,7 +227,7 @@ class ExpansionPipeline(BaseModel):
     stages: list[ExpansionPipelineStage]
 
 
-# ── Team Performance ────────────────────────────────────────────────────
+# -- Team Performance ------------------------------------------------------
 
 class CSMPerformance(BaseModel):
     owner_email: str
@@ -241,13 +241,13 @@ class CSMPerformance(BaseModel):
     retention_rate: float
 
 
-# ── Tags ────────────────────────────────────────────────────────────────
+# -- Tags -------------------------------------------------------------------
 
 class TagRequest(BaseModel):
     tag: str = Field(..., min_length=1, max_length=50)
 
 
-# ── NPS Surveys ─────────────────────────────────────────────────────────
+# -- NPS Surveys ------------------------------------------------------------
 
 class NPSSurveyCreate(BaseModel):
     customer_id: int
@@ -286,7 +286,7 @@ class NPSOverview(BaseModel):
     trend: list[NPSTrendPoint]
 
 
-# ── Churn Risk ──────────────────────────────────────────────────────────
+# -- Churn Risk -------------------------------------------------------------
 
 class ChurnRiskFactor(BaseModel):
     factor: str
@@ -303,7 +303,7 @@ class ChurnRisk(BaseModel):
     recommendation: str
 
 
-# ── Stakeholder Contacts ────────────────────────────────────────────────
+# -- Stakeholder Contacts ---------------------------------------------------
 
 class ContactCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -327,7 +327,7 @@ class ContactResponse(BaseModel):
     created_at: str
 
 
-# ── Customer Goals ──────────────────────────────────────────────────────
+# -- Customer Goals ---------------------------------------------------------
 
 class GoalCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
@@ -360,7 +360,7 @@ class GoalResponse(BaseModel):
     updated_at: str
 
 
-# ── Handoff / Transfer ─────────────────────────────────────────────────
+# -- Handoff / Transfer ----------------------------------------------------
 
 class HandoffCreate(BaseModel):
     to_owner: str = Field(..., min_length=1, description="Email of the new CSM owner")
@@ -387,7 +387,7 @@ class HandoffHistory(BaseModel):
     handoffs: list[HandoffResponse]
 
 
-# ── Customer Milestones ────────────────────────────────────────────────
+# -- Customer Milestones ---------------------------------------------------
 
 class MilestoneCreate(BaseModel):
     milestone_type: str = Field(
@@ -438,7 +438,7 @@ class MilestoneAnalytics(BaseModel):
     least_achieved: Optional[str]
 
 
-# ── Escalation Management ──────────────────────────────────────────────
+# -- Escalation Management -------------------------------------------------
 
 class EscalationCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=300)
@@ -478,3 +478,186 @@ class EscalationStats(BaseModel):
     by_severity: dict  # {critical: N, high: N, ...}
     avg_resolution_hours: Optional[float]
     sla_breach_rate: float  # 0-100%
+
+
+# ==========================================================================
+# == v1.0.0 Feature 1: Customer Health Alerts ==============================
+# ==========================================================================
+
+class HealthAlertCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    condition_type: str = Field(
+        ..., description="health_below | health_drop | churn_risk_above | no_touchpoint_days"
+    )
+    threshold: float = Field(..., description="Threshold value for the condition")
+    notification_email: Optional[str] = None
+    is_enabled: Optional[bool] = True
+
+
+class HealthAlertUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    threshold: Optional[float] = None
+    notification_email: Optional[str] = None
+    is_enabled: Optional[bool] = None
+
+
+class HealthAlertResponse(BaseModel):
+    id: int
+    name: str
+    condition_type: str
+    threshold: float
+    notification_email: Optional[str]
+    is_enabled: bool
+    times_triggered: int
+    last_triggered_at: Optional[str]
+    created_at: str
+
+
+class AlertLogEntry(BaseModel):
+    id: int
+    alert_id: int
+    customer_id: int
+    customer_name: str
+    alert_name: str
+    condition_type: str
+    threshold: float
+    actual_value: float
+    message: str
+    is_acknowledged: bool
+    triggered_at: str
+    acknowledged_at: Optional[str]
+
+
+class AlertSummary(BaseModel):
+    total_rules: int
+    active_rules: int
+    total_alerts: int
+    unacknowledged: int
+    recent_alerts: list[AlertLogEntry]
+
+
+# ==========================================================================
+# == v1.0.0 Feature 2: Success Plans ======================================
+# ==========================================================================
+
+class SuccessPlanCreate(BaseModel):
+    customer_id: int
+    title: str = Field(..., min_length=1, max_length=300)
+    description: Optional[str] = None
+    owner_email: str = Field(..., min_length=1)
+    start_date: Optional[str] = None
+    target_date: Optional[str] = None
+
+
+class SuccessPlanUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=300)
+    description: Optional[str] = None
+    owner_email: Optional[str] = None
+    status: Optional[str] = Field(None, description="draft | active | completed | cancelled")
+    target_date: Optional[str] = None
+
+
+class SuccessPlanResponse(BaseModel):
+    id: int
+    customer_id: int
+    title: str
+    description: Optional[str]
+    owner_email: str
+    status: str
+    start_date: Optional[str]
+    target_date: Optional[str]
+    progress_pct: float
+    tasks_total: int
+    tasks_completed: int
+    is_overdue: bool
+    created_at: str
+    updated_at: str
+
+
+class PlanTaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    description: Optional[str] = None
+    assignee_email: Optional[str] = None
+    priority: str = Field("medium", description="high | medium | low")
+    due_date: Optional[str] = None
+
+
+class PlanTaskUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=300)
+    description: Optional[str] = None
+    assignee_email: Optional[str] = None
+    status: Optional[str] = Field(None, description="pending | in_progress | completed | blocked")
+    priority: Optional[str] = Field(None, description="high | medium | low")
+    due_date: Optional[str] = None
+
+
+class PlanTaskResponse(BaseModel):
+    id: int
+    plan_id: int
+    title: str
+    description: Optional[str]
+    assignee_email: Optional[str]
+    status: str
+    priority: str
+    due_date: Optional[str]
+    completed_at: Optional[str]
+    created_at: str
+
+
+class PlanOverview(BaseModel):
+    total_plans: int
+    by_status: dict  # {draft: N, active: N, ...}
+    avg_progress: float
+    overdue_count: int
+
+
+# ==========================================================================
+# == v1.0.0 Feature 3: Customer Feedback Loop =============================
+# ==========================================================================
+
+class FeedbackCreate(BaseModel):
+    customer_id: int
+    type: str = Field(
+        ..., description="feature_request | bug_report | improvement | praise | complaint"
+    )
+    title: str = Field(..., min_length=1, max_length=300)
+    description: Optional[str] = None
+    priority: str = Field("medium", description="critical | high | medium | low")
+    submitted_by: Optional[str] = None
+
+
+class FeedbackUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=300)
+    description: Optional[str] = None
+    priority: Optional[str] = Field(None, description="critical | high | medium | low")
+    status: Optional[str] = Field(
+        None, description="new | acknowledged | planned | in_progress | completed | declined"
+    )
+
+
+class FeedbackResponse(BaseModel):
+    id: int
+    customer_id: int
+    customer_name: str
+    type: str
+    title: str
+    description: Optional[str]
+    priority: str
+    status: str
+    submitted_by: Optional[str]
+    votes: int
+    created_at: str
+    updated_at: str
+
+
+class FeedbackVote(BaseModel):
+    voter_email: Optional[str] = None
+
+
+class FeedbackStats(BaseModel):
+    total: int
+    by_type: dict  # {feature_request: N, ...}
+    by_status: dict  # {new: N, ...}
+    by_priority: dict  # {critical: N, ...}
+    top_voted: list[FeedbackResponse]
+    recent: list[FeedbackResponse]
