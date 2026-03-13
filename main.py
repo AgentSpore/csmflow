@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from models import (
     CustomerCreate, CustomerUpdate, CustomerResponse,
@@ -17,6 +18,8 @@ from models import (
     ExpansionStageUpdate, ExpansionPipeline, CSMPerformance,
     TagRequest, NPSSurveyCreate, NPSSurveyResponse, NPSOverview,
     ChurnRisk,
+    ContactCreate, ContactResponse,
+    GoalCreate, GoalUpdate, GoalResponse,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
@@ -32,6 +35,9 @@ from engine import (
     add_customer_tag, remove_customer_tag,
     record_nps_survey, list_nps_surveys, get_nps_overview,
     compute_churn_risk,
+    add_contact, list_contacts, update_contact_last_contacted, delete_contact,
+    create_goal, list_goals, update_goal, get_at_risk_goals,
+    export_customers_csv,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -49,9 +55,11 @@ app = FastAPI(
     description=(
         "Customer success management pipeline: health scores, touchpoints, playbooks, "
         "renewal tracking, QBRs, segments, expansion tracking, team performance, "
-        "customer tags, NPS surveys with trend analysis, and churn risk assessment."
+        "customer tags, NPS surveys with trend analysis, churn risk assessment, "
+        "stakeholder contacts with role mapping, customer goals with progress tracking, "
+        "and customer CSV export for reporting."
     ),
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -59,7 +67,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "0.8.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -67,6 +75,20 @@ async def health():
 @app.post("/customers", response_model=CustomerResponse, status_code=201)
 async def add_customer(body: CustomerCreate):
     return await create_customer(app.state.db, body.model_dump())
+
+
+@app.get("/customers/export/csv")
+async def export_csv(
+    segment: str | None = Query(None, description="enterprise | mid_market | smb | startup | general"),
+    health: str | None = Query(None, description="critical | at_risk | neutral | healthy | champion"),
+    plan: str | None = Query(None),
+):
+    """Export customer data as CSV for reporting and compliance."""
+    data = await export_customers_csv(app.state.db, segment, health, plan)
+    return StreamingResponse(
+        iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=customers.csv"},
+    )
 
 
 @app.get("/customers", response_model=list[CustomerResponse])
@@ -148,6 +170,82 @@ async def untag_customer(customer_id: int, body: TagRequest):
     if not result:
         raise HTTPException(404, "Customer not found")
     return result
+
+
+# ── Stakeholder Contacts ────────────────────────────────────────────────
+
+@app.post("/customers/{customer_id}/contacts", response_model=ContactResponse, status_code=201)
+async def create_contact(customer_id: int, body: ContactCreate):
+    """Add a stakeholder contact to a customer account."""
+    c = await get_customer(app.state.db, customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    result = await add_contact(app.state.db, customer_id, body.model_dump())
+    if result == "duplicate_email":
+        raise HTTPException(409, "Contact with this email already exists for this customer")
+    return result
+
+
+@app.get("/customers/{customer_id}/contacts", response_model=list[ContactResponse])
+async def get_contacts(customer_id: int):
+    """List stakeholder contacts for a customer, ordered by influence."""
+    c = await get_customer(app.state.db, customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await list_contacts(app.state.db, customer_id)
+
+
+@app.post("/contacts/{contact_id}/touch", response_model=ContactResponse)
+async def touch_contact(contact_id: int):
+    """Record that this contact was contacted (updates last_contacted_at)."""
+    result = await update_contact_last_contacted(app.state.db, contact_id)
+    if not result:
+        raise HTTPException(404, "Contact not found")
+    return result
+
+
+@app.delete("/contacts/{contact_id}", status_code=204)
+async def remove_contact(contact_id: int):
+    if not await delete_contact(app.state.db, contact_id):
+        raise HTTPException(404, "Contact not found")
+
+
+# ── Customer Goals ──────────────────────────────────────────────────────
+
+@app.post("/customers/{customer_id}/goals", response_model=GoalResponse, status_code=201)
+async def add_goal(customer_id: int, body: GoalCreate):
+    """Create a measurable goal for a customer with target date and value."""
+    c = await get_customer(app.state.db, customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await create_goal(app.state.db, customer_id, body.model_dump())
+
+
+@app.get("/customers/{customer_id}/goals", response_model=list[GoalResponse])
+async def get_goals(
+    customer_id: int,
+    status: str | None = Query(None, description="active | completed | at_risk | cancelled"),
+):
+    """List goals for a customer, optionally filtered by status."""
+    c = await get_customer(app.state.db, customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await list_goals(app.state.db, customer_id, status)
+
+
+@app.patch("/goals/{goal_id}", response_model=GoalResponse)
+async def patch_goal(goal_id: int, body: GoalUpdate):
+    """Update goal progress, status, or add notes."""
+    result = await update_goal(app.state.db, goal_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Goal not found")
+    return result
+
+
+@app.get("/goals/at-risk", response_model=list[GoalResponse])
+async def at_risk_goals():
+    """Goals that are past due or behind pace (active goals only)."""
+    return await get_at_risk_goals(app.state.db)
 
 
 # ── Churn Risk ───────────────────────────────────────────────────────────
@@ -311,7 +409,7 @@ async def customer_timeline(
     customer_id: int,
     limit: int = Query(50, ge=1, le=500),
 ):
-    """Unified activity feed: touchpoints, QBRs, NPS surveys, lifecycle events."""
+    """Unified activity feed: touchpoints, QBRs, NPS surveys, goals, lifecycle events."""
     result = await get_customer_timeline(app.state.db, customer_id, limit)
     if not result:
         raise HTTPException(404, "Customer not found")
