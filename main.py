@@ -11,6 +11,8 @@ from models import (
     PlaybookCreate, PlaybookResponse,
     HealthScoreUpdate, CSMStats,
     RenewalUpdate, RenewalPipelineItem,
+    QBRCreate, QBRComplete, QBRResponse,
+    SegmentUpdate, SegmentStats,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
@@ -18,6 +20,8 @@ from engine import (
     create_playbook, list_playbooks, get_csm_stats,
     list_upcoming_actions, get_stats_by_owner,
     set_renewal, get_renewal_pipeline, get_at_risk_renewals, delete_customer,
+    create_qbr, list_qbrs, get_qbr, complete_qbr, get_upcoming_qbrs,
+    set_customer_segment, get_segment_stats,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -32,8 +36,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CSMFlow",
-    description="Customer success management pipeline: health scores, touchpoints, playbooks, renewal tracking.",
-    version="0.4.0",
+    description="Customer success management pipeline: health scores, touchpoints, playbooks, renewal tracking, QBRs, segments.",
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,7 +45,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -55,8 +59,9 @@ async def add_customer(body: CustomerCreate):
 async def get_customers(
     health: str | None = Query(None, description="critical | at_risk | neutral | healthy | champion"),
     plan: str | None = Query(None),
+    segment: str | None = Query(None, description="enterprise | mid_market | smb | startup | general"),
 ):
-    return await list_customers(app.state.db, health, plan)
+    return await list_customers(app.state.db, health, plan, segment)
 
 
 @app.get("/customers/{customer_id}", response_model=CustomerResponse)
@@ -97,6 +102,14 @@ async def update_customer_health(customer_id: int, body: HealthScoreUpdate):
 @app.post("/customers/{customer_id}/renewal", response_model=CustomerResponse)
 async def update_renewal(customer_id: int, body: RenewalUpdate):
     c = await set_renewal(app.state.db, customer_id, body.renewal_date, body.contract_value)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return c
+
+
+@app.put("/customers/{customer_id}/segment", response_model=CustomerResponse)
+async def update_segment(customer_id: int, body: SegmentUpdate):
+    c = await set_customer_segment(app.state.db, customer_id, body.segment)
     if not c:
         raise HTTPException(404, "Customer not found")
     return c
@@ -153,10 +166,51 @@ async def get_touchpoints(
 async def add_playbook(body: PlaybookCreate):
     return await create_playbook(app.state.db, body.model_dump())
 
-
 @app.get("/playbooks", response_model=list[PlaybookResponse])
 async def get_playbooks():
     return await list_playbooks(app.state.db)
+
+
+# ── QBRs ─────────────────────────────────────────────────────────────────
+
+@app.post("/qbrs", response_model=QBRResponse, status_code=201)
+async def schedule_qbr(body: QBRCreate):
+    c = await get_customer(app.state.db, body.customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await create_qbr(app.state.db, body.model_dump())
+
+
+@app.get("/qbrs/upcoming", response_model=list[QBRResponse])
+async def upcoming_qbrs(
+    days: int = Query(30, ge=1, le=365, description="Look-ahead window in days"),
+):
+    """Scheduled QBRs within the next N days, with customer info."""
+    return await get_upcoming_qbrs(app.state.db, days)
+
+
+@app.get("/qbrs", response_model=list[QBRResponse])
+async def get_qbrs(
+    customer_id: int | None = Query(None),
+    status: str | None = Query(None, description="scheduled | completed"),
+):
+    return await list_qbrs(app.state.db, customer_id, status)
+
+
+@app.get("/qbrs/{qbr_id}", response_model=QBRResponse)
+async def get_qbr_detail(qbr_id: int):
+    q = await get_qbr(app.state.db, qbr_id)
+    if not q:
+        raise HTTPException(404, "QBR not found")
+    return q
+
+
+@app.post("/qbrs/{qbr_id}/complete", response_model=QBRResponse)
+async def complete_qbr_endpoint(qbr_id: int, body: QBRComplete):
+    q = await complete_qbr(app.state.db, qbr_id, body.outcome, body.action_items)
+    if not q:
+        raise HTTPException(404, "QBR not found")
+    return q
 
 
 # ── Stats ────────────────────────────────────────────────────────────────
@@ -165,6 +219,12 @@ async def get_playbooks():
 async def stats_by_owner():
     """Per-CSM breakdown: customers, MRR, avg health, at-risk count, touchpoints last 30d."""
     return await get_stats_by_owner(app.state.db)
+
+
+@app.get("/stats/segments", response_model=list[SegmentStats])
+async def segment_stats():
+    """Per-segment breakdown: customers, MRR, avg health, at-risk count."""
+    return await get_segment_stats(app.state.db)
 
 
 @app.get("/stats", response_model=CSMStats)
