@@ -39,6 +39,7 @@ class CustomerResponse(BaseModel):
     days_since_onboarding: Optional[int]
     renewal_date: Optional[str]
     contract_value: Optional[float]
+    segment: str = "general"
     notes: Optional[str]
     created_at: str
 
@@ -106,6 +107,47 @@ class HealthScoreUpdate(BaseModel):
     support_tickets: int = Field(0, ge=0, description="Open support tickets")
     nps_score: Optional[int] = Field(None, ge=0, le=10, description="Latest NPS response")
     days_to_value: Optional[int] = Field(None, description="Days to first key milestone")
+
+
+# ── QBR Models ──────────────────────────────────────────────────────────
+
+class QBRCreate(BaseModel):
+    customer_id: int
+    scheduled_date: str = Field(..., description="ISO date (YYYY-MM-DD) of the QBR meeting")
+    attendees: list[str] = Field(default_factory=list, description="List of attendee emails")
+    agenda: Optional[str] = None
+
+
+class QBRComplete(BaseModel):
+    outcome: str = Field(..., description="Summary of QBR outcome")
+    action_items: list[str] = Field(default_factory=list, description="Follow-up action items")
+
+
+class QBRResponse(BaseModel):
+    id: int
+    customer_id: int
+    scheduled_date: str
+    status: str
+    attendees: list[str]
+    agenda: Optional[str]
+    outcome: Optional[str]
+    action_items: list[str]
+    completed_at: Optional[str]
+    created_at: str
+
+
+# ── Segment Models ──────────────────────────────────────────────────────
+
+class SegmentUpdate(BaseModel):
+    segment: str = Field(..., description="Segment: enterprise | mid_market | smb | startup | general")
+
+
+class SegmentStats(BaseModel):
+    segment: str
+    customers: int
+    total_mrr: float
+    avg_health_score: float
+    at_risk_count: int
 
 
 class CSMStats(BaseModel):
