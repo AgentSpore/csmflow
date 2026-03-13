@@ -109,7 +109,7 @@ class HealthScoreUpdate(BaseModel):
     days_to_value: Optional[int] = Field(None, description="Days to first key milestone")
 
 
-# ── QBR Models ──────────────────────────────────────────────────────────
+# ── QBR Models ───────────────────────────────────────────────────────────
 
 class QBRCreate(BaseModel):
     customer_id: int
@@ -136,7 +136,7 @@ class QBRResponse(BaseModel):
     created_at: str
 
 
-# ── Segment Models ──────────────────────────────────────────────────────
+# ── Segment Models ───────────────────────────────────────────────────────
 
 class SegmentUpdate(BaseModel):
     segment: str = Field(..., description="Segment: enterprise | mid_market | smb | startup | general")
@@ -160,3 +160,77 @@ class CSMStats(BaseModel):
     upcoming_actions: int
     renewals_next_30d: int
     at_risk_renewal_value: float
+
+
+# ── Timeline ────────────────────────────────────────────────────────────
+
+class TimelineEvent(BaseModel):
+    type: str
+    subtype: str
+    summary: str
+    outcome: str
+    timestamp: str
+
+
+class CustomerTimeline(BaseModel):
+    customer_id: int
+    customer_name: str
+    company: str
+    total_events: int
+    events: list[TimelineEvent]
+
+
+# ── Expansion ───────────────────────────────────────────────────────────
+
+class ExpansionCreate(BaseModel):
+    customer_id: int
+    type: str = Field("upsell", description="upsell | cross_sell | add_on")
+    description: str = Field(..., min_length=1)
+    expected_mrr: float = Field(0, ge=0, description="Expected monthly revenue increase")
+    stage: str = Field("identified", description="identified | qualified | proposal | negotiation | won | lost")
+    owner_email: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ExpansionResponse(BaseModel):
+    id: int
+    customer_id: int
+    type: str
+    description: str
+    expected_mrr: float
+    stage: str
+    owner_email: Optional[str]
+    notes: Optional[str]
+    closed_at: Optional[str]
+    created_at: str
+
+
+class ExpansionStageUpdate(BaseModel):
+    stage: str = Field(..., description="identified | qualified | proposal | negotiation | won | lost")
+
+
+class ExpansionPipelineStage(BaseModel):
+    stage: str
+    count: int
+    total_mrr: float
+
+
+class ExpansionPipeline(BaseModel):
+    total_opportunities: int
+    total_pipeline_mrr: float
+    won_mrr: float
+    stages: list[ExpansionPipelineStage]
+
+
+# ── Team Performance ────────────────────────────────────────────────────
+
+class CSMPerformance(BaseModel):
+    owner_email: str
+    customers: int
+    total_mrr: float
+    avg_health_score: float
+    at_risk_count: int
+    champions: int
+    touchpoints_last_30d: int
+    touchpoint_frequency: float
+    retention_rate: float
