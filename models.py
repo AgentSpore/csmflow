@@ -40,6 +40,7 @@ class CustomerResponse(BaseModel):
     renewal_date: Optional[str]
     contract_value: Optional[float]
     segment: str = "general"
+    tags: list[str] = Field(default_factory=list)
     notes: Optional[str]
     created_at: str
 
@@ -160,6 +161,8 @@ class CSMStats(BaseModel):
     upcoming_actions: int
     renewals_next_30d: int
     at_risk_renewal_value: float
+    total_nps_surveys: int
+    avg_nps: float
 
 
 # ── Timeline ────────────────────────────────────────────────────────────
@@ -234,3 +237,65 @@ class CSMPerformance(BaseModel):
     touchpoints_last_30d: int
     touchpoint_frequency: float
     retention_rate: float
+
+
+# ── Tags ────────────────────────────────────────────────────────────────
+
+class TagRequest(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=50)
+
+
+# ── NPS Surveys ─────────────────────────────────────────────────────────
+
+class NPSSurveyCreate(BaseModel):
+    customer_id: int
+    score: int = Field(..., ge=0, le=10, description="NPS score 0-10")
+    feedback: Optional[str] = Field(None, max_length=2000)
+
+
+class NPSSurveyResponse(BaseModel):
+    id: int
+    customer_id: int
+    customer_name: str
+    score: int
+    category: str  # promoter | passive | detractor
+    feedback: Optional[str]
+    created_at: str
+
+
+class NPSTrendPoint(BaseModel):
+    period: str
+    avg_score: float
+    promoters: int
+    passives: int
+    detractors: int
+    responses: int
+    nps_score: float  # (promoters - detractors) / total * 100
+
+
+class NPSOverview(BaseModel):
+    total_surveys: int
+    avg_score: float
+    nps_score: float
+    promoters_pct: float
+    passives_pct: float
+    detractors_pct: float
+    by_segment: list[dict]
+    trend: list[NPSTrendPoint]
+
+
+# ── Churn Risk ──────────────────────────────────────────────────────────
+
+class ChurnRiskFactor(BaseModel):
+    factor: str
+    impact: int  # negative impact points
+    detail: str
+
+
+class ChurnRisk(BaseModel):
+    customer_id: int
+    customer_name: str
+    risk_score: int  # 0-100, higher = more risk
+    risk_level: str  # critical | high | medium | low
+    factors: list[ChurnRiskFactor]
+    recommendation: str
