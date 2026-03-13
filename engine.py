@@ -75,12 +75,40 @@ HEALTH_LABELS = {
     range(85, 101): "champion",
 }
 
+VALID_MILESTONE_TYPES = {
+    "onboarding_complete", "first_value", "adoption_milestone",
+    "expansion_qualified", "renewal_signed", "champion_identified",
+    "executive_sponsor", "integration_complete",
+}
+
+VALID_ESCALATION_SEVERITIES = {"critical", "high", "medium", "low"}
+VALID_ESCALATION_CATEGORIES = {"support", "billing", "executive", "technical", "legal"}
+VALID_ESCALATION_STATUSES = {"open", "investigating", "pending_resolution", "resolved", "closed"}
+
+DEFAULT_SLA_HOURS = {
+    "critical": 4,
+    "high": 8,
+    "medium": 24,
+    "low": 72,
+}
+
+VALID_HANDOFF_STATUSES = {"pending", "completed", "cancelled"}
+
 
 def _health_label(score: int) -> str:
     for r, label in HEALTH_LABELS.items():
         if score in r:
             return label
     return "unknown"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_activity(action: str, detail: str) -> dict:
+    """Return an activity dict for audit trail logging."""
+    return {"action": action, "detail": detail, "timestamp": _now()}
 
 
 async def init_db(path: str) -> aiosqlite.Connection:
@@ -162,6 +190,61 @@ async def init_db(path: str) -> aiosqlite.Connection:
         CREATE INDEX IF NOT EXISTS idx_goals_customer ON customer_goals(customer_id);
         CREATE INDEX IF NOT EXISTS idx_goals_status ON customer_goals(status);
     """)
+    # Migration: handoffs table (v0.9.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS handoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            from_owner TEXT,
+            to_owner TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_handoffs_customer ON handoffs(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status);
+        CREATE INDEX IF NOT EXISTS idx_handoffs_from ON handoffs(from_owner);
+        CREATE INDEX IF NOT EXISTS idx_handoffs_to ON handoffs(to_owner);
+    """)
+    # Migration: milestones table (v0.9.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            milestone_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            notes TEXT,
+            achieved_at TEXT NOT NULL,
+            created_by TEXT,
+            UNIQUE(customer_id, milestone_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_milestones_customer ON milestones(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_milestones_type ON milestones(milestone_type);
+    """)
+    # Migration: escalations table (v0.9.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            category TEXT NOT NULL,
+            assigned_to TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            resolution TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_at TEXT,
+            sla_hours INTEGER NOT NULL DEFAULT 24
+        );
+        CREATE INDEX IF NOT EXISTS idx_escalations_customer ON escalations(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status);
+        CREATE INDEX IF NOT EXISTS idx_escalations_severity ON escalations(severity);
+        CREATE INDEX IF NOT EXISTS idx_escalations_category ON escalations(category);
+    """)
     await db.commit()
     return db
 
@@ -229,7 +312,7 @@ def compute_health_score(login_freq: int, feature_adoption: int,
 
 
 async def create_customer(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO customers (name, company, email, plan, mrr, owner_email, onboarded_at, notes, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -368,13 +451,16 @@ async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
     await db.execute("DELETE FROM touchpoints WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM contacts WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customer_goals WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM handoffs WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM milestones WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM escalations WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     await db.commit()
     return True
 
 
 async def add_touchpoint(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO touchpoints (customer_id, type, summary, outcome, next_action, next_action_date, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -396,7 +482,7 @@ async def list_touchpoints(db: aiosqlite.Connection, customer_id: int | None = N
 
 
 async def create_playbook(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO playbooks (name, trigger, steps, description, created_at) VALUES (?, ?, ?, ?, ?)",
         (data["name"], data["trigger"], json.dumps(data["steps"]), data.get("description"), now)
@@ -542,7 +628,7 @@ def _qbr_row(r: aiosqlite.Row) -> dict:
 
 
 async def create_qbr(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO qbrs (customer_id, scheduled_date, attendees, agenda, created_at)
            VALUES (?, ?, ?, ?, ?)""",
@@ -579,7 +665,7 @@ async def complete_qbr(db: aiosqlite.Connection, qbr_id: int, outcome: str,
     rows = await db.execute_fetchall("SELECT * FROM qbrs WHERE id = ?", (qbr_id,))
     if not rows:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "UPDATE qbrs SET status = 'completed', outcome = ?, action_items = ?, completed_at = ? WHERE id = ?",
         (outcome, json.dumps(action_items), now, qbr_id),
@@ -706,6 +792,58 @@ async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
             "timestamp": g["updated_at"],
         })
 
+    # Milestones (v0.9.0)
+    ms_rows = await db.execute_fetchall(
+        "SELECT * FROM milestones WHERE customer_id = ? ORDER BY achieved_at DESC",
+        (customer_id,),
+    )
+    for m in ms_rows:
+        events.append({
+            "type": "milestone",
+            "subtype": m["milestone_type"],
+            "summary": f"Milestone achieved: {m['title']}",
+            "outcome": "positive",
+            "timestamp": m["achieved_at"],
+        })
+
+    # Escalations (v0.9.0)
+    esc_rows = await db.execute_fetchall(
+        "SELECT * FROM escalations WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for e in esc_rows:
+        if e["status"] in ("resolved", "closed"):
+            events.append({
+                "type": "escalation_resolved",
+                "subtype": e["severity"],
+                "summary": f"Escalation resolved: {e['title']} ({e['severity']}){' -- ' + e['resolution'] if e['resolution'] else ''}",
+                "outcome": "positive",
+                "timestamp": e["resolved_at"] or e["updated_at"],
+            })
+        else:
+            events.append({
+                "type": "escalation",
+                "subtype": e["severity"],
+                "summary": f"Escalation [{e['severity']}]: {e['title']} (status: {e['status']})",
+                "outcome": "negative" if e["severity"] in ("critical", "high") else "neutral",
+                "timestamp": e["created_at"],
+            })
+
+    # Handoffs (v0.9.0)
+    ho_rows = await db.execute_fetchall(
+        "SELECT * FROM handoffs WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for h in ho_rows:
+        from_label = h["from_owner"] or "unassigned"
+        events.append({
+            "type": "handoff",
+            "subtype": h["status"],
+            "summary": f"Handoff {h['status']}: {from_label} -> {h['to_owner']} ({h['reason']})",
+            "outcome": "positive" if h["status"] == "completed" else "neutral",
+            "timestamp": h["completed_at"] or h["created_at"],
+        })
+
     # Customer creation
     events.append({
         "type": "customer_created",
@@ -752,7 +890,7 @@ async def _migrate_expansions(db: aiosqlite.Connection):
 
 async def create_expansion(db: aiosqlite.Connection, data: dict) -> dict:
     await _migrate_expansions(db)
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO expansions (customer_id, type, description, expected_mrr, stage, owner_email, notes, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -806,7 +944,7 @@ async def update_expansion_stage(db: aiosqlite.Connection, exp_id: int,
         return None
     closed_at = None
     if stage in ("won", "lost"):
-        closed_at = datetime.now(timezone.utc).isoformat()
+        closed_at = _now()
     await db.execute(
         "UPDATE expansions SET stage = ?, closed_at = ? WHERE id = ?",
         (stage, closed_at, exp_id),
@@ -891,7 +1029,7 @@ async def add_customer_tag(db: aiosqlite.Connection, customer_id: int, tag: str)
     customer = await get_customer(db, customer_id)
     if not customer:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         await db.execute(
             "INSERT INTO customer_tags (customer_id, tag, created_at) VALUES (?, ?, ?)",
@@ -930,7 +1068,7 @@ async def record_nps_survey(db: aiosqlite.Connection, data: dict) -> dict | None
     customer = await get_customer(db, data["customer_id"])
     if not customer:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO nps_surveys (customer_id, score, feedback, created_at) VALUES (?, ?, ?, ?)",
         (data["customer_id"], data["score"], data.get("feedback"), now),
@@ -1206,7 +1344,7 @@ def _contact_row(r: aiosqlite.Row) -> dict:
 
 
 async def add_contact(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict | str:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         cur = await db.execute(
             """INSERT INTO contacts (customer_id, name, email, role, influence, phone, notes, created_at)
@@ -1231,7 +1369,7 @@ async def list_contacts(db: aiosqlite.Connection, customer_id: int) -> list[dict
 
 
 async def update_contact_last_contacted(db: aiosqlite.Connection, contact_id: int) -> dict | None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "UPDATE contacts SET last_contacted_at = ? WHERE id = ?", (now, contact_id),
     )
@@ -1275,7 +1413,7 @@ def _goal_row(r: aiosqlite.Row) -> dict:
 
 
 async def create_goal(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO customer_goals
            (customer_id, title, description, target_date, target_value, current_value, owner_email, created_at, updated_at)
@@ -1305,7 +1443,7 @@ async def update_goal(db: aiosqlite.Connection, goal_id: int, updates: dict) -> 
     rows = await db.execute_fetchall("SELECT * FROM customer_goals WHERE id = ?", (goal_id,))
     if not rows:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     sets = ["updated_at = ?"]
     params: list = [now]
     if updates.get("current_value") is not None:
@@ -1387,3 +1525,505 @@ async def export_customers_csv(db: aiosqlite.Connection, segment: str | None = N
             row["tags"] = ", ".join(row["tags"])
         writer.writerow(row)
     return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Feature 1: Customer Handoff / Transfer (v0.9.0) ─────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _handoff_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "from_owner": r["from_owner"],
+        "to_owner": r["to_owner"],
+        "reason": r["reason"],
+        "notes": r["notes"],
+        "status": r["status"],
+        "created_at": r["created_at"],
+        "completed_at": r["completed_at"],
+    }
+
+
+async def create_handoff(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict | str | None:
+    """Create a handoff: transfer customer ownership to a new CSM.
+    Immediately sets customer.owner_email to to_owner and marks handoff as completed.
+    """
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    to_owner = data["to_owner"].strip()
+    from_owner = customer.get("owner_email")
+
+    # Prevent self-transfer
+    if from_owner and from_owner == to_owner:
+        return "cannot_transfer_to_same_owner"
+
+    now = _now()
+
+    # Create handoff record
+    cur = await db.execute(
+        """INSERT INTO handoffs (customer_id, from_owner, to_owner, reason, notes, status, created_at, completed_at)
+           VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)""",
+        (customer_id, from_owner, to_owner, data["reason"], data.get("notes"), now, now),
+    )
+
+    # Update customer owner
+    await db.execute(
+        "UPDATE customers SET owner_email = ? WHERE id = ?",
+        (to_owner, customer_id),
+    )
+    await db.commit()
+
+    _log_activity("handoff", f"Customer {customer_id} transferred from {from_owner} to {to_owner}")
+
+    rows = await db.execute_fetchall("SELECT * FROM handoffs WHERE id = ?", (cur.lastrowid,))
+    return _handoff_row(rows[0])
+
+
+async def list_handoffs(db: aiosqlite.Connection,
+                         customer_id: int | None = None,
+                         from_owner: str | None = None,
+                         to_owner: str | None = None,
+                         status: str | None = None) -> list[dict]:
+    """List handoffs with optional filters."""
+    q = "SELECT * FROM handoffs WHERE 1=1"
+    params: list = []
+    if customer_id:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if from_owner:
+        q += " AND from_owner = ?"
+        params.append(from_owner)
+    if to_owner:
+        q += " AND to_owner = ?"
+        params.append(to_owner)
+    if status:
+        if status not in VALID_HANDOFF_STATUSES:
+            return []
+        q += " AND status = ?"
+        params.append(status)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_handoff_row(r) for r in rows]
+
+
+async def complete_handoff(db: aiosqlite.Connection, handoff_id: int) -> dict | str | None:
+    """Mark a pending handoff as completed and update customer owner."""
+    rows = await db.execute_fetchall("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    if not rows:
+        return None
+    h = rows[0]
+    if h["status"] != "pending":
+        return f"Handoff is already {h['status']}, cannot complete"
+
+    now = _now()
+    await db.execute(
+        "UPDATE handoffs SET status = 'completed', completed_at = ? WHERE id = ?",
+        (now, handoff_id),
+    )
+    # Update customer owner
+    await db.execute(
+        "UPDATE customers SET owner_email = ? WHERE id = ?",
+        (h["to_owner"], h["customer_id"]),
+    )
+    await db.commit()
+
+    _log_activity("handoff_completed", f"Handoff {handoff_id} completed for customer {h['customer_id']}")
+
+    rows = await db.execute_fetchall("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    return _handoff_row(rows[0])
+
+
+async def cancel_handoff(db: aiosqlite.Connection, handoff_id: int) -> dict | str | None:
+    """Cancel a pending handoff. Does not revert customer ownership if already completed."""
+    rows = await db.execute_fetchall("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    if not rows:
+        return None
+    h = rows[0]
+    if h["status"] == "completed":
+        return "Cannot cancel a completed handoff"
+    if h["status"] == "cancelled":
+        return "Handoff is already cancelled"
+
+    now = _now()
+    await db.execute(
+        "UPDATE handoffs SET status = 'cancelled', completed_at = ? WHERE id = ?",
+        (now, handoff_id),
+    )
+    await db.commit()
+
+    _log_activity("handoff_cancelled", f"Handoff {handoff_id} cancelled for customer {h['customer_id']}")
+
+    rows = await db.execute_fetchall("SELECT * FROM handoffs WHERE id = ?", (handoff_id,))
+    return _handoff_row(rows[0])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Feature 2: Customer Milestones (v0.9.0) ─────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _milestone_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "milestone_type": r["milestone_type"],
+        "title": r["title"],
+        "notes": r["notes"],
+        "achieved_at": r["achieved_at"],
+        "created_by": r["created_by"],
+    }
+
+
+async def add_milestone(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict | str | None:
+    """Add a milestone for a customer. Prevents duplicate milestone types per customer."""
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    milestone_type = data["milestone_type"]
+    if milestone_type not in VALID_MILESTONE_TYPES:
+        return f"Invalid milestone_type. Must be one of: {', '.join(sorted(VALID_MILESTONE_TYPES))}"
+
+    # Default title based on type if not provided
+    title = data.get("title") or milestone_type.replace("_", " ").title()
+
+    now = _now()
+    try:
+        cur = await db.execute(
+            """INSERT INTO milestones (customer_id, milestone_type, title, notes, achieved_at, created_by)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (customer_id, milestone_type, title, data.get("notes"), now, data.get("created_by")),
+        )
+        await db.commit()
+    except Exception:
+        return "duplicate_milestone"
+
+    _log_activity("milestone_achieved", f"Customer {customer_id} achieved milestone: {milestone_type}")
+
+    rows = await db.execute_fetchall("SELECT * FROM milestones WHERE id = ?", (cur.lastrowid,))
+    return _milestone_row(rows[0])
+
+
+async def list_milestones(db: aiosqlite.Connection, customer_id: int,
+                            milestone_type: str | None = None) -> list[dict]:
+    """List milestones for a customer, optionally filtered by type."""
+    q = "SELECT * FROM milestones WHERE customer_id = ?"
+    params: list = [customer_id]
+    if milestone_type:
+        q += " AND milestone_type = ?"
+        params.append(milestone_type)
+    q += " ORDER BY achieved_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_milestone_row(r) for r in rows]
+
+
+async def delete_milestone(db: aiosqlite.Connection, milestone_id: int) -> bool:
+    """Delete a milestone by ID."""
+    cur = await db.execute("DELETE FROM milestones WHERE id = ?", (milestone_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_milestone_coverage(db: aiosqlite.Connection, customer_id: int) -> dict | None:
+    """Get milestone coverage for a customer: percentage of possible milestones achieved."""
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    total_possible = len(VALID_MILESTONE_TYPES)
+    rows = await db.execute_fetchall(
+        "SELECT milestone_type FROM milestones WHERE customer_id = ?",
+        (customer_id,),
+    )
+    achieved_types = [r["milestone_type"] for r in rows]
+    achieved_count = len(achieved_types)
+    missing_types = sorted(VALID_MILESTONE_TYPES - set(achieved_types))
+    coverage_pct = round(achieved_count / total_possible * 100, 1) if total_possible else 0.0
+
+    return {
+        "customer_id": customer_id,
+        "customer_name": customer["name"],
+        "total_possible": total_possible,
+        "achieved": achieved_count,
+        "coverage_pct": coverage_pct,
+        "achieved_types": sorted(achieved_types),
+        "missing_types": missing_types,
+    }
+
+
+async def get_milestone_analytics(db: aiosqlite.Connection) -> dict:
+    """Analytics: which milestones are most/least achieved across all customers."""
+    total_customers_rows = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM customers")
+    total_customers = total_customers_rows[0]["cnt"] if total_customers_rows else 0
+
+    rows = await db.execute_fetchall("""
+        SELECT milestone_type, COUNT(*) as cnt
+        FROM milestones
+        GROUP BY milestone_type
+        ORDER BY cnt DESC
+    """)
+
+    total_achieved = sum(r["cnt"] for r in rows)
+    by_type = []
+    for r in rows:
+        pct = round(r["cnt"] / max(total_customers, 1) * 100, 1)
+        by_type.append({
+            "type": r["milestone_type"],
+            "count": r["cnt"],
+            "pct_of_customers": pct,
+        })
+
+    # Add types with zero achievements
+    achieved_set = {r["milestone_type"] for r in rows}
+    for mt in sorted(VALID_MILESTONE_TYPES - achieved_set):
+        by_type.append({"type": mt, "count": 0, "pct_of_customers": 0.0})
+
+    most_achieved = by_type[0]["type"] if by_type and by_type[0]["count"] > 0 else None
+    # Find least achieved (non-zero first, then zero)
+    least_achieved = None
+    if by_type:
+        # Sort by count ascending to find least achieved
+        sorted_by_count = sorted(by_type, key=lambda x: x["count"])
+        least_achieved = sorted_by_count[0]["type"] if sorted_by_count else None
+
+    return {
+        "total_customers": total_customers,
+        "total_milestones_achieved": total_achieved,
+        "by_type": by_type,
+        "most_achieved": most_achieved,
+        "least_achieved": least_achieved,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Feature 3: Escalation Management (v0.9.0) ───────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _escalation_row(r: aiosqlite.Row) -> dict:
+    """Build escalation response dict with computed is_sla_breached field."""
+    sla_hours = r["sla_hours"]
+    created_at = r["created_at"]
+    resolved_at = r["resolved_at"]
+
+    # Compute SLA breach
+    is_sla_breached = False
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+        sla_deadline = created_dt + timedelta(hours=sla_hours)
+        if resolved_at:
+            resolved_dt = datetime.fromisoformat(resolved_at)
+            is_sla_breached = resolved_dt > sla_deadline
+        else:
+            # Still open — check if current time exceeds SLA
+            is_sla_breached = datetime.now(timezone.utc) > sla_deadline
+    except Exception:
+        pass
+
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "title": r["title"],
+        "description": r["description"],
+        "severity": r["severity"],
+        "category": r["category"],
+        "assigned_to": r["assigned_to"],
+        "status": r["status"],
+        "resolution": r["resolution"],
+        "created_at": created_at,
+        "updated_at": r["updated_at"],
+        "resolved_at": resolved_at,
+        "sla_hours": sla_hours,
+        "is_sla_breached": is_sla_breached,
+    }
+
+
+async def create_escalation(db: aiosqlite.Connection, customer_id: int, data: dict) -> dict | str | None:
+    """Create an escalation for a customer."""
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    severity = data["severity"]
+    if severity not in VALID_ESCALATION_SEVERITIES:
+        return f"Invalid severity. Must be one of: {', '.join(sorted(VALID_ESCALATION_SEVERITIES))}"
+
+    category = data["category"]
+    if category not in VALID_ESCALATION_CATEGORIES:
+        return f"Invalid category. Must be one of: {', '.join(sorted(VALID_ESCALATION_CATEGORIES))}"
+
+    # Default SLA hours by severity
+    sla_hours = data.get("sla_hours") or DEFAULT_SLA_HOURS.get(severity, 24)
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO escalations
+           (customer_id, title, description, severity, category, assigned_to, status, created_at, updated_at, sla_hours)
+           VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+        (customer_id, data["title"], data["description"], severity, category,
+         data.get("assigned_to"), now, now, sla_hours),
+    )
+    await db.commit()
+
+    _log_activity("escalation_created", f"Escalation created for customer {customer_id}: {data['title']} ({severity})")
+
+    rows = await db.execute_fetchall("SELECT * FROM escalations WHERE id = ?", (cur.lastrowid,))
+    return _escalation_row(rows[0])
+
+
+async def list_escalations(db: aiosqlite.Connection,
+                             customer_id: int | None = None,
+                             status: str | None = None,
+                             severity: str | None = None,
+                             category: str | None = None,
+                             assigned_to: str | None = None) -> list[dict]:
+    """List escalations with optional filters."""
+    q = "SELECT * FROM escalations WHERE 1=1"
+    params: list = []
+    if customer_id:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    if status:
+        if status not in VALID_ESCALATION_STATUSES:
+            return []
+        q += " AND status = ?"
+        params.append(status)
+    if severity:
+        if severity not in VALID_ESCALATION_SEVERITIES:
+            return []
+        q += " AND severity = ?"
+        params.append(severity)
+    if category:
+        if category not in VALID_ESCALATION_CATEGORIES:
+            return []
+        q += " AND category = ?"
+        params.append(category)
+    if assigned_to:
+        q += " AND assigned_to = ?"
+        params.append(assigned_to)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_escalation_row(r) for r in rows]
+
+
+async def get_escalation(db: aiosqlite.Connection, escalation_id: int) -> dict | None:
+    """Get a single escalation by ID."""
+    rows = await db.execute_fetchall("SELECT * FROM escalations WHERE id = ?", (escalation_id,))
+    if not rows:
+        return None
+    return _escalation_row(rows[0])
+
+
+async def update_escalation(db: aiosqlite.Connection, escalation_id: int, updates: dict) -> dict | str | None:
+    """Update an escalation: status transitions, assignment, resolution."""
+    rows = await db.execute_fetchall("SELECT * FROM escalations WHERE id = ?", (escalation_id,))
+    if not rows:
+        return None
+
+    current = rows[0]
+    now = _now()
+    sets = ["updated_at = ?"]
+    params: list = [now]
+
+    new_status = updates.get("status")
+    if new_status:
+        if new_status not in VALID_ESCALATION_STATUSES:
+            return f"Invalid status. Must be one of: {', '.join(sorted(VALID_ESCALATION_STATUSES))}"
+
+        # Validate status transitions
+        current_status = current["status"]
+        # Cannot reopen closed/resolved escalations to open
+        if current_status in ("resolved", "closed") and new_status == "open":
+            return f"Cannot transition from {current_status} to open"
+
+        sets.append("status = ?")
+        params.append(new_status)
+
+        # Set resolved_at when transitioning to resolved or closed
+        if new_status in ("resolved", "closed") and not current["resolved_at"]:
+            sets.append("resolved_at = ?")
+            params.append(now)
+
+    if updates.get("assigned_to") is not None:
+        sets.append("assigned_to = ?")
+        params.append(updates["assigned_to"])
+
+    if updates.get("resolution") is not None:
+        sets.append("resolution = ?")
+        params.append(updates["resolution"])
+
+    params.append(escalation_id)
+    await db.execute(
+        f"UPDATE escalations SET {', '.join(sets)} WHERE id = ?",
+        params,
+    )
+    await db.commit()
+
+    _log_activity("escalation_updated", f"Escalation {escalation_id} updated")
+
+    return await get_escalation(db, escalation_id)
+
+
+async def get_escalation_stats(db: aiosqlite.Connection) -> dict:
+    """Escalation analytics: totals, by status, by severity, avg resolution time, SLA breach rate."""
+    all_rows = await db.execute_fetchall("SELECT * FROM escalations")
+    total = len(all_rows)
+
+    if not total:
+        return {
+            "total": 0,
+            "by_status": {},
+            "by_severity": {},
+            "avg_resolution_hours": None,
+            "sla_breach_rate": 0.0,
+        }
+
+    # By status
+    by_status: dict[str, int] = {}
+    for r in all_rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+
+    # By severity
+    by_severity: dict[str, int] = {}
+    for r in all_rows:
+        by_severity[r["severity"]] = by_severity.get(r["severity"], 0) + 1
+
+    # Avg resolution hours (only for resolved/closed with resolved_at)
+    resolution_hours = []
+    sla_breached = 0
+    sla_evaluated = 0
+    for r in all_rows:
+        sla_hours = r["sla_hours"]
+        created_at = r["created_at"]
+        resolved_at = r["resolved_at"]
+
+        try:
+            created_dt = datetime.fromisoformat(created_at)
+            sla_deadline = created_dt + timedelta(hours=sla_hours)
+
+            if resolved_at:
+                resolved_dt = datetime.fromisoformat(resolved_at)
+                hours = (resolved_dt - created_dt).total_seconds() / 3600
+                resolution_hours.append(hours)
+                sla_evaluated += 1
+                if resolved_dt > sla_deadline:
+                    sla_breached += 1
+            else:
+                # Still open -- evaluate SLA breach for open items too
+                sla_evaluated += 1
+                if datetime.now(timezone.utc) > sla_deadline:
+                    sla_breached += 1
+        except Exception:
+            pass
+
+    avg_resolution = round(sum(resolution_hours) / len(resolution_hours), 1) if resolution_hours else None
+    sla_breach_rate = round(sla_breached / max(sla_evaluated, 1) * 100, 1)
+
+    return {
+        "total": total,
+        "by_status": by_status,
+        "by_severity": by_severity,
+        "avg_resolution_hours": avg_resolution,
+        "sla_breach_rate": sla_breach_rate,
+    }
