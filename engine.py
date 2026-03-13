@@ -531,3 +531,235 @@ async def get_segment_stats(db: aiosqlite.Connection) -> list[dict]:
     """)
     return [{"segment": r["segment"], "customers": r["count"], "total_mrr": r["total_mrr"],
              "avg_health_score": r["avg_health"], "at_risk_count": r["at_risk"]} for r in rows]
+
+
+# ── Customer Timeline ────────────────────────────────────────────────────
+
+async def get_customer_timeline(db: aiosqlite.Connection, customer_id: int,
+                                 limit: int = 50) -> dict | None:
+    """Unified activity feed for a customer: touchpoints, health changes, QBRs, renewals."""
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    events = []
+
+    # Touchpoints
+    tp_rows = await db.execute_fetchall(
+        "SELECT * FROM touchpoints WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for tp in tp_rows:
+        events.append({
+            "type": "touchpoint",
+            "subtype": tp["type"],
+            "summary": tp["summary"],
+            "outcome": tp["outcome"],
+            "timestamp": tp["created_at"],
+        })
+
+    # QBRs
+    qbr_rows = await db.execute_fetchall(
+        "SELECT * FROM qbrs WHERE customer_id = ? ORDER BY created_at DESC",
+        (customer_id,),
+    )
+    for q in qbr_rows:
+        if q["status"] == "completed":
+            events.append({
+                "type": "qbr_completed",
+                "subtype": "qbr",
+                "summary": f"QBR completed: {q['outcome'] or 'no outcome recorded'}",
+                "outcome": "positive",
+                "timestamp": q["completed_at"] or q["created_at"],
+            })
+        else:
+            events.append({
+                "type": "qbr_scheduled",
+                "subtype": "qbr",
+                "summary": f"QBR scheduled for {q['scheduled_date']}",
+                "outcome": "neutral",
+                "timestamp": q["created_at"],
+            })
+
+    # Customer creation
+    events.append({
+        "type": "customer_created",
+        "subtype": "lifecycle",
+        "summary": f"Customer {customer['name']} ({customer['company']}) added",
+        "outcome": "positive",
+        "timestamp": customer["created_at"],
+    })
+
+    events.sort(key=lambda e: e["timestamp"], reverse=True)
+    return {
+        "customer_id": customer_id,
+        "customer_name": customer["name"],
+        "company": customer["company"],
+        "total_events": len(events),
+        "events": events[:limit],
+    }
+
+
+# ── Expansion Tracking ──────────────────────────────────────────────────
+
+VALID_OPP_STAGES = {"identified", "qualified", "proposal", "negotiation", "won", "lost"}
+
+
+async def _migrate_expansions(db: aiosqlite.Connection):
+    """Create expansions table if needed."""
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS expansions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            type TEXT NOT NULL DEFAULT 'upsell',
+            description TEXT NOT NULL,
+            expected_mrr REAL NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT 'identified',
+            owner_email TEXT,
+            notes TEXT,
+            closed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exp_customer ON expansions(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_exp_stage ON expansions(stage);
+    """)
+    await db.commit()
+
+
+async def create_expansion(db: aiosqlite.Connection, data: dict) -> dict:
+    await _migrate_expansions(db)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO expansions (customer_id, type, description, expected_mrr, stage, owner_email, notes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data["customer_id"], data.get("type", "upsell"), data["description"],
+         data.get("expected_mrr", 0), data.get("stage", "identified"),
+         data.get("owner_email"), data.get("notes"), now),
+    )
+    await db.commit()
+    return await _get_expansion(db, cur.lastrowid)
+
+
+async def _get_expansion(db: aiosqlite.Connection, exp_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM expansions WHERE id = ?", (exp_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "id": r["id"], "customer_id": r["customer_id"], "type": r["type"],
+        "description": r["description"], "expected_mrr": r["expected_mrr"],
+        "stage": r["stage"], "owner_email": r["owner_email"],
+        "notes": r["notes"], "closed_at": r["closed_at"], "created_at": r["created_at"],
+    }
+
+
+async def list_expansions(db: aiosqlite.Connection, customer_id: int | None = None,
+                           stage: str | None = None) -> list[dict]:
+    await _migrate_expansions(db)
+    q = "SELECT * FROM expansions WHERE 1=1"
+    params: list = []
+    if customer_id:
+        q += " AND customer_id = ?"; params.append(customer_id)
+    if stage:
+        q += " AND stage = ?"; params.append(stage)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [{
+        "id": r["id"], "customer_id": r["customer_id"], "type": r["type"],
+        "description": r["description"], "expected_mrr": r["expected_mrr"],
+        "stage": r["stage"], "owner_email": r["owner_email"],
+        "notes": r["notes"], "closed_at": r["closed_at"], "created_at": r["created_at"],
+    } for r in rows]
+
+
+async def update_expansion_stage(db: aiosqlite.Connection, exp_id: int,
+                                  stage: str) -> dict | str | None:
+    await _migrate_expansions(db)
+    if stage not in VALID_OPP_STAGES:
+        return f"Invalid stage. Must be one of: {', '.join(sorted(VALID_OPP_STAGES))}"
+    rows = await db.execute_fetchall("SELECT id FROM expansions WHERE id = ?", (exp_id,))
+    if not rows:
+        return None
+    closed_at = None
+    if stage in ("won", "lost"):
+        closed_at = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE expansions SET stage = ?, closed_at = ? WHERE id = ?",
+        (stage, closed_at, exp_id),
+    )
+    await db.commit()
+    return await _get_expansion(db, exp_id)
+
+
+async def get_expansion_pipeline(db: aiosqlite.Connection) -> dict:
+    """Expansion revenue pipeline grouped by stage."""
+    await _migrate_expansions(db)
+    rows = await db.execute_fetchall("""
+        SELECT stage, COUNT(*) as count, COALESCE(SUM(expected_mrr), 0) as total_mrr
+        FROM expansions GROUP BY stage ORDER BY total_mrr DESC
+    """)
+    stages = [{"stage": r["stage"], "count": r["count"], "total_mrr": round(r["total_mrr"], 2)} for r in rows]
+    total = sum(s["total_mrr"] for s in stages)
+    won = next((s["total_mrr"] for s in stages if s["stage"] == "won"), 0)
+    return {
+        "total_opportunities": sum(s["count"] for s in stages),
+        "total_pipeline_mrr": round(total, 2),
+        "won_mrr": round(won, 2),
+        "stages": stages,
+    }
+
+
+# ── Team Performance ────────────────────────────────────────────────────
+
+async def get_team_performance(db: aiosqlite.Connection) -> list[dict]:
+    """Per-CSM performance metrics: customers, MRR, health improvement, touchpoint frequency, renewal rate."""
+    owners = await db.execute_fetchall(
+        "SELECT DISTINCT owner_email FROM customers WHERE owner_email IS NOT NULL"
+    )
+    result = []
+    for o in owners:
+        email = o["owner_email"]
+        custs = await db.execute_fetchall(
+            "SELECT * FROM customers WHERE owner_email = ?", (email,))
+        total = len(custs)
+        if not total:
+            continue
+        mrr = sum(c["mrr"] for c in custs)
+        avg_health = round(sum(c["health_score"] for c in custs) / total, 1)
+        at_risk = sum(1 for c in custs if c["health_score"] < 50)
+        champions = sum(1 for c in custs if c["health_score"] >= 85)
+
+        ids = tuple(c["id"] for c in custs)
+        placeholders = ",".join("?" * len(ids))
+
+        # Touchpoints last 30d
+        since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        tp_rows = await db.execute_fetchall(
+            f"SELECT COUNT(*) as cnt FROM touchpoints WHERE customer_id IN ({placeholders}) AND created_at >= ?",
+            (*ids, since_30d),
+        )
+        tp_30d = tp_rows[0]["cnt"] if tp_rows else 0
+
+        # Renewal success rate
+        today = datetime.utcnow().date().isoformat()
+        past_renewals = await db.execute_fetchall(
+            f"SELECT COUNT(*) as total, SUM(CASE WHEN health_score >= 50 THEN 1 ELSE 0 END) as healthy FROM customers WHERE owner_email = ? AND renewal_date IS NOT NULL AND renewal_date <= ?",
+            (email, today),
+        )
+        r_total = past_renewals[0]["total"] if past_renewals else 0
+        r_healthy = past_renewals[0]["healthy"] if past_renewals else 0
+        retention_rate = round(r_healthy / max(r_total, 1) * 100, 1)
+
+        result.append({
+            "owner_email": email,
+            "customers": total,
+            "total_mrr": round(mrr, 2),
+            "avg_health_score": avg_health,
+            "at_risk_count": at_risk,
+            "champions": champions,
+            "touchpoints_last_30d": tp_30d,
+            "touchpoint_frequency": round(tp_30d / total, 1),
+            "retention_rate": retention_rate,
+        })
+    result.sort(key=lambda x: x["total_mrr"], reverse=True)
+    return result

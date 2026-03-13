@@ -13,6 +13,8 @@ from models import (
     RenewalUpdate, RenewalPipelineItem,
     QBRCreate, QBRComplete, QBRResponse,
     SegmentUpdate, SegmentStats,
+    CustomerTimeline, ExpansionCreate, ExpansionResponse,
+    ExpansionStageUpdate, ExpansionPipeline, CSMPerformance,
 )
 from engine import (
     init_db, create_customer, list_customers, get_customer, update_customer, update_health,
@@ -22,6 +24,9 @@ from engine import (
     set_renewal, get_renewal_pipeline, get_at_risk_renewals, delete_customer,
     create_qbr, list_qbrs, get_qbr, complete_qbr, get_upcoming_qbrs,
     set_customer_segment, get_segment_stats,
+    get_customer_timeline,
+    create_expansion, list_expansions, update_expansion_stage, get_expansion_pipeline,
+    get_team_performance,
 )
 
 DB_PATH = os.getenv("DB_PATH", "csmflow.db")
@@ -37,7 +42,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="CSMFlow",
     description="Customer success management pipeline: health scores, touchpoints, playbooks, renewal tracking, QBRs, segments.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -45,7 +50,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 # ── Customers ────────────────────────────────────────────────────────────
@@ -230,3 +235,59 @@ async def segment_stats():
 @app.get("/stats", response_model=CSMStats)
 async def csm_stats():
     return await get_csm_stats(app.state.db)
+
+
+# ── Customer Timeline ───────────────────────────────────────────────────
+
+@app.get("/customers/{customer_id}/timeline", response_model=CustomerTimeline)
+async def customer_timeline(
+    customer_id: int,
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Unified activity feed: touchpoints, QBRs, lifecycle events."""
+    result = await get_customer_timeline(app.state.db, customer_id, limit)
+    if not result:
+        raise HTTPException(404, "Customer not found")
+    return result
+
+
+# ── Expansion Tracking ──────────────────────────────────────────────────
+
+@app.post("/expansions", response_model=ExpansionResponse, status_code=201)
+async def add_expansion(body: ExpansionCreate):
+    c = await get_customer(app.state.db, body.customer_id)
+    if not c:
+        raise HTTPException(404, "Customer not found")
+    return await create_expansion(app.state.db, body.model_dump())
+
+
+@app.get("/expansions/pipeline", response_model=ExpansionPipeline)
+async def expansion_pipeline():
+    """Revenue pipeline grouped by opportunity stage."""
+    return await get_expansion_pipeline(app.state.db)
+
+
+@app.get("/expansions", response_model=list[ExpansionResponse])
+async def get_expansions(
+    customer_id: int | None = Query(None),
+    stage: str | None = Query(None, description="identified | qualified | proposal | negotiation | won | lost"),
+):
+    return await list_expansions(app.state.db, customer_id, stage)
+
+
+@app.put("/expansions/{expansion_id}/stage", response_model=ExpansionResponse)
+async def change_expansion_stage(expansion_id: int, body: ExpansionStageUpdate):
+    result = await update_expansion_stage(app.state.db, expansion_id, body.stage)
+    if result is None:
+        raise HTTPException(404, "Expansion opportunity not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+# ── Team Performance ────────────────────────────────────────────────────
+
+@app.get("/stats/team", response_model=list[CSMPerformance])
+async def team_performance():
+    """Per-CSM performance: customers, MRR, health, touchpoint frequency, retention."""
+    return await get_team_performance(app.state.db)
