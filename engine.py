@@ -326,6 +326,78 @@ async def init_db(path: str) -> aiosqlite.Connection:
         CREATE INDEX IF NOT EXISTS idx_feedback_type ON customer_feedback(type);
         CREATE INDEX IF NOT EXISTS idx_feedback_status ON customer_feedback(status);
     """)
+    # Migration: cohorts + cohort_snapshots tables (v1.1.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS cohorts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            cohort_type TEXT NOT NULL,
+            criteria TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cohort_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cohort_id INTEGER NOT NULL REFERENCES cohorts(id) ON DELETE CASCADE,
+            snapshot_date TEXT NOT NULL,
+            customer_count INTEGER NOT NULL DEFAULT 0,
+            avg_health REAL NOT NULL DEFAULT 0,
+            avg_mrr REAL NOT NULL DEFAULT 0,
+            churned_count INTEGER NOT NULL DEFAULT 0,
+            expanded_count INTEGER NOT NULL DEFAULT 0,
+            nps_avg REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cohort_snapshots_cohort ON cohort_snapshots(cohort_id);
+        CREATE INDEX IF NOT EXISTS idx_cohort_snapshots_date ON cohort_snapshots(snapshot_date);
+    """)
+    # Migration: engagement_scores + engagement_config tables (v1.1.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS engagement_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL UNIQUE REFERENCES customers(id) ON DELETE CASCADE,
+            score REAL NOT NULL DEFAULT 0,
+            touchpoint_frequency REAL NOT NULL DEFAULT 0,
+            response_rate REAL NOT NULL DEFAULT 0,
+            feature_adoption REAL NOT NULL DEFAULT 0,
+            last_interaction_days INTEGER NOT NULL DEFAULT 0,
+            decay_factor REAL NOT NULL DEFAULT 1,
+            calculated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_engagement_customer ON engagement_scores(customer_id);
+        CREATE TABLE IF NOT EXISTS engagement_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            touchpoint_weight REAL NOT NULL DEFAULT 0.4,
+            response_weight REAL NOT NULL DEFAULT 0.3,
+            adoption_weight REAL NOT NULL DEFAULT 0.3,
+            decay_rate_per_day REAL NOT NULL DEFAULT 0.02,
+            score_threshold_high REAL NOT NULL DEFAULT 70,
+            score_threshold_low REAL NOT NULL DEFAULT 30,
+            updated_at TEXT NOT NULL
+        );
+    """)
+    # Seed default engagement config if empty
+    existing_cfg = await db.execute_fetchall("SELECT id FROM engagement_config LIMIT 1")
+    if not existing_cfg:
+        await db.execute(
+            "INSERT INTO engagement_config (touchpoint_weight, response_weight, adoption_weight, decay_rate_per_day, score_threshold_high, score_threshold_low, updated_at) VALUES (0.4, 0.3, 0.3, 0.02, 70, 30, ?)",
+            (_now(),),
+        )
+    # Migration: revenue_events table (v1.1.0)
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS revenue_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            mrr_before REAL NOT NULL DEFAULT 0,
+            mrr_after REAL NOT NULL DEFAULT 0,
+            mrr_delta REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_revenue_events_customer ON revenue_events(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_revenue_events_type ON revenue_events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_revenue_events_date ON revenue_events(created_at);
+    """)
     await db.commit()
     return db
 
@@ -538,6 +610,8 @@ async def delete_customer(db: aiosqlite.Connection, customer_id: int) -> bool:
     await db.execute("DELETE FROM escalations WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM health_alert_log WHERE customer_id = ?", (customer_id,))
     await db.execute("DELETE FROM customer_feedback WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM engagement_scores WHERE customer_id = ?", (customer_id,))
+    await db.execute("DELETE FROM revenue_events WHERE customer_id = ?", (customer_id,))
     for sp in await db.execute_fetchall("SELECT id FROM success_plans WHERE customer_id = ?", (customer_id,)):
         await db.execute("DELETE FROM plan_tasks WHERE plan_id = ?", (sp["id"],))
     await db.execute("DELETE FROM success_plans WHERE customer_id = ?", (customer_id,))
@@ -2683,3 +2757,679 @@ async def get_feedback_stats(db: aiosqlite.Connection) -> dict:
         "total_votes": total_votes[0]["total"],
         "top_voted": [_feedback_row(r) for r in top_voted],
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Cohort Analysis (v1.1.0) ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _cohort_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "cohort_type": r["cohort_type"],
+        "criteria": json.loads(r["criteria"]) if r["criteria"] else {},
+        "created_at": r["created_at"],
+    }
+
+
+def _cohort_snapshot_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "cohort_id": r["cohort_id"],
+        "snapshot_date": r["snapshot_date"],
+        "customer_count": r["customer_count"],
+        "avg_health": round(r["avg_health"], 1),
+        "avg_mrr": round(r["avg_mrr"], 2),
+        "churned_count": r["churned_count"],
+        "expanded_count": r["expanded_count"],
+        "nps_avg": round(r["nps_avg"], 1),
+        "created_at": r["created_at"],
+    }
+
+
+async def create_cohort(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    criteria = data.get("criteria") or {}
+    cur = await db.execute(
+        "INSERT INTO cohorts (name, cohort_type, criteria, created_at) VALUES (?, ?, ?, ?)",
+        (data["name"], data["cohort_type"], json.dumps(criteria), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM cohorts WHERE id = ?", (cur.lastrowid,))
+    return _cohort_row(rows[0])
+
+
+async def list_cohorts(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM cohorts ORDER BY created_at DESC")
+    return [_cohort_row(r) for r in rows]
+
+
+async def get_cohort(db: aiosqlite.Connection, cohort_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM cohorts WHERE id = ?", (cohort_id,))
+    if not rows:
+        return None
+    d = _cohort_row(rows[0])
+    # Attach latest snapshot
+    snap_rows = await db.execute_fetchall(
+        "SELECT * FROM cohort_snapshots WHERE cohort_id = ? ORDER BY snapshot_date DESC LIMIT 1",
+        (cohort_id,),
+    )
+    d["latest_snapshot"] = _cohort_snapshot_row(snap_rows[0]) if snap_rows else None
+    return d
+
+
+async def delete_cohort(db: aiosqlite.Connection, cohort_id: int) -> bool:
+    await db.execute("DELETE FROM cohort_snapshots WHERE cohort_id = ?", (cohort_id,))
+    cur = await db.execute("DELETE FROM cohorts WHERE id = ?", (cohort_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def _get_cohort_customers(db: aiosqlite.Connection, cohort: dict) -> list:
+    """Return customer rows matching cohort criteria."""
+    cohort_type = cohort["cohort_type"]
+    criteria = cohort.get("criteria") or {}
+    if isinstance(criteria, str):
+        criteria = json.loads(criteria)
+
+    q = "SELECT * FROM customers WHERE 1=1"
+    params: list = []
+
+    if cohort_type == "signup_month":
+        month = criteria.get("month")  # e.g. "2025-01"
+        if month:
+            q += " AND created_at LIKE ?"
+            params.append(f"{month}%")
+    elif cohort_type == "plan":
+        plan = criteria.get("plan")
+        if plan:
+            q += " AND plan = ?"
+            params.append(plan)
+    elif cohort_type == "segment":
+        segment = criteria.get("segment")
+        if segment:
+            q += " AND segment = ?"
+            params.append(segment)
+    elif cohort_type == "custom":
+        if criteria.get("min_mrr") is not None:
+            q += " AND mrr >= ?"
+            params.append(criteria["min_mrr"])
+        if criteria.get("max_mrr") is not None:
+            q += " AND mrr <= ?"
+            params.append(criteria["max_mrr"])
+        if criteria.get("plan"):
+            q += " AND plan = ?"
+            params.append(criteria["plan"])
+        if criteria.get("segment"):
+            q += " AND segment = ?"
+            params.append(criteria["segment"])
+        if criteria.get("min_health") is not None:
+            q += " AND health_score >= ?"
+            params.append(criteria["min_health"])
+        if criteria.get("max_health") is not None:
+            q += " AND health_score <= ?"
+            params.append(criteria["max_health"])
+
+    q += " ORDER BY mrr DESC"
+    return await db.execute_fetchall(q, params)
+
+
+async def take_cohort_snapshot(db: aiosqlite.Connection, cohort_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM cohorts WHERE id = ?", (cohort_id,))
+    if not rows:
+        return None
+    cohort = _cohort_row(rows[0])
+    customers = await _get_cohort_customers(db, cohort)
+    now = _now()
+    count = len(customers)
+    avg_health = round(sum(c["health_score"] for c in customers) / max(count, 1), 1)
+    avg_mrr = round(sum(c["mrr"] for c in customers) / max(count, 1), 2)
+
+    # Churned: health < 30
+    churned = sum(1 for c in customers if c["health_score"] < 30)
+
+    # Expanded: has expansion with stage = closed_won (or 'won')
+    expanded = 0
+    try:
+        for c in customers:
+            exp_rows = await db.execute_fetchall(
+                "SELECT id FROM expansions WHERE customer_id = ? AND stage = 'won'",
+                (c["id"],),
+            )
+            if exp_rows:
+                expanded += 1
+    except Exception:
+        pass
+
+    # NPS avg
+    nps_avg_val = 0.0
+    if count > 0:
+        cust_ids = [c["id"] for c in customers]
+        if cust_ids:
+            placeholders = ",".join("?" * len(cust_ids))
+            nps_rows = await db.execute_fetchall(
+                f"SELECT COALESCE(AVG(score), 0) as avg FROM nps_surveys WHERE customer_id IN ({placeholders})",
+                cust_ids,
+            )
+            nps_avg_val = round(nps_rows[0]["avg"], 1) if nps_rows else 0.0
+
+    cur = await db.execute(
+        """INSERT INTO cohort_snapshots
+           (cohort_id, snapshot_date, customer_count, avg_health, avg_mrr, churned_count, expanded_count, nps_avg, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (cohort_id, now[:10], count, avg_health, avg_mrr, churned, expanded, nps_avg_val, now),
+    )
+    await db.commit()
+    snap_rows = await db.execute_fetchall("SELECT * FROM cohort_snapshots WHERE id = ?", (cur.lastrowid,))
+    return _cohort_snapshot_row(snap_rows[0])
+
+
+async def list_cohort_snapshots(db: aiosqlite.Connection, cohort_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM cohort_snapshots WHERE cohort_id = ? ORDER BY snapshot_date ASC",
+        (cohort_id,),
+    )
+    return [_cohort_snapshot_row(r) for r in rows]
+
+
+async def list_cohort_customers(db: aiosqlite.Connection, cohort_id: int) -> list[dict] | None:
+    rows = await db.execute_fetchall("SELECT * FROM cohorts WHERE id = ?", (cohort_id,))
+    if not rows:
+        return None
+    cohort = _cohort_row(rows[0])
+    customers = await _get_cohort_customers(db, cohort)
+    result = []
+    for c in customers:
+        tags = await _get_customer_tags(db, c["id"])
+        result.append(_customer_row(c, tags))
+    return result
+
+
+async def compare_cohorts(db: aiosqlite.Connection, cohort_ids: list[int] | None = None) -> list[dict]:
+    if cohort_ids:
+        placeholders = ",".join("?" * len(cohort_ids))
+        cohort_rows = await db.execute_fetchall(
+            f"SELECT * FROM cohorts WHERE id IN ({placeholders})", cohort_ids
+        )
+    else:
+        cohort_rows = await db.execute_fetchall("SELECT * FROM cohorts ORDER BY created_at DESC")
+
+    result = []
+    for cr in cohort_rows:
+        cohort = _cohort_row(cr)
+        # Get latest snapshot
+        snap = await db.execute_fetchall(
+            "SELECT * FROM cohort_snapshots WHERE cohort_id = ? ORDER BY snapshot_date DESC LIMIT 1",
+            (cr["id"],),
+        )
+        snapshot = _cohort_snapshot_row(snap[0]) if snap else None
+        result.append({
+            "cohort_id": cohort["id"],
+            "name": cohort["name"],
+            "cohort_type": cohort["cohort_type"],
+            "customer_count": snapshot["customer_count"] if snapshot else 0,
+            "avg_health": snapshot["avg_health"] if snapshot else 0,
+            "avg_mrr": snapshot["avg_mrr"] if snapshot else 0,
+            "churned_count": snapshot["churned_count"] if snapshot else 0,
+            "expanded_count": snapshot["expanded_count"] if snapshot else 0,
+            "nps_avg": snapshot["nps_avg"] if snapshot else 0,
+            "snapshot_date": snapshot["snapshot_date"] if snapshot else None,
+        })
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Engagement Scoring (v1.1.0) ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _engagement_score_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "score": round(r["score"], 1),
+        "touchpoint_frequency": round(r["touchpoint_frequency"], 1),
+        "response_rate": round(r["response_rate"], 1),
+        "feature_adoption": round(r["feature_adoption"], 1),
+        "last_interaction_days": r["last_interaction_days"],
+        "decay_factor": round(r["decay_factor"], 3),
+        "calculated_at": r["calculated_at"],
+    }
+
+
+def _engagement_config_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "touchpoint_weight": r["touchpoint_weight"],
+        "response_weight": r["response_weight"],
+        "adoption_weight": r["adoption_weight"],
+        "decay_rate_per_day": r["decay_rate_per_day"],
+        "score_threshold_high": r["score_threshold_high"],
+        "score_threshold_low": r["score_threshold_low"],
+        "updated_at": r["updated_at"],
+    }
+
+
+async def get_engagement_config(db: aiosqlite.Connection) -> dict:
+    rows = await db.execute_fetchall("SELECT * FROM engagement_config LIMIT 1")
+    if not rows:
+        return {
+            "id": 0, "touchpoint_weight": 0.4, "response_weight": 0.3,
+            "adoption_weight": 0.3, "decay_rate_per_day": 0.02,
+            "score_threshold_high": 70, "score_threshold_low": 30,
+            "updated_at": _now(),
+        }
+    return _engagement_config_row(rows[0])
+
+
+async def update_engagement_config(db: aiosqlite.Connection, updates: dict) -> dict:
+    config = await get_engagement_config(db)
+    now = _now()
+    fields = {"updated_at": now}
+    for k in ("touchpoint_weight", "response_weight", "adoption_weight",
+              "decay_rate_per_day", "score_threshold_high", "score_threshold_low"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [config["id"]]
+    await db.execute(f"UPDATE engagement_config SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    return await get_engagement_config(db)
+
+
+async def calculate_engagement_score(db: aiosqlite.Connection, customer_id: int) -> dict | None:
+    customer = await get_customer(db, customer_id)
+    if not customer:
+        return None
+
+    config = await get_engagement_config(db)
+    now = _now()
+    now_dt = datetime.now(timezone.utc)
+
+    # touchpoint_frequency: count touchpoints in last 90 days / 90 * 100 (capped 100)
+    since_90d = (now_dt - timedelta(days=90)).isoformat()
+    tp_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM touchpoints WHERE customer_id = ? AND created_at >= ?",
+        (customer_id, since_90d),
+    )
+    tp_count = tp_rows[0]["cnt"] if tp_rows else 0
+    touchpoint_frequency = min(tp_count / 90 * 100, 100)
+
+    # response_rate: touchpoints with outcome != null / total touchpoints * 100
+    all_tp = await db.execute_fetchall(
+        "SELECT COUNT(*) as total, SUM(CASE WHEN outcome IS NOT NULL AND outcome != '' THEN 1 ELSE 0 END) as responded FROM touchpoints WHERE customer_id = ?",
+        (customer_id,),
+    )
+    total_tp = all_tp[0]["total"] if all_tp else 0
+    responded_tp = all_tp[0]["responded"] if all_tp else 0
+    response_rate = (responded_tp / max(total_tp, 1)) * 100
+
+    # feature_adoption: (goals completed + milestones achieved) / max(1, goals + milestones) * 100
+    goals_total = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM customer_goals WHERE customer_id = ?", (customer_id,))
+    goals_completed = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM customer_goals WHERE customer_id = ? AND status = 'completed'",
+        (customer_id,))
+    milestones_achieved = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM milestones WHERE customer_id = ?", (customer_id,))
+    g_total = (goals_total[0]["cnt"] if goals_total else 0)
+    g_completed = (goals_completed[0]["cnt"] if goals_completed else 0)
+    m_achieved = (milestones_achieved[0]["cnt"] if milestones_achieved else 0)
+    denominator = max(1, g_total + m_achieved)
+    feat_adoption = (g_completed + m_achieved) / denominator * 100
+
+    # last_interaction_days
+    last_tp = await db.execute_fetchall(
+        "SELECT MAX(created_at) as last_tp FROM touchpoints WHERE customer_id = ?",
+        (customer_id,),
+    )
+    last_interaction_days = 9999
+    if last_tp and last_tp[0]["last_tp"]:
+        try:
+            last_dt = datetime.fromisoformat(last_tp[0]["last_tp"])
+            last_interaction_days = max(0, (now_dt - last_dt).days)
+        except Exception:
+            pass
+
+    # decay_factor
+    decay_rate = config["decay_rate_per_day"]
+    decay_factor = max(0, 1 - decay_rate * last_interaction_days)
+
+    # score
+    w1 = config["touchpoint_weight"]
+    w2 = config["response_weight"]
+    w3 = config["adoption_weight"]
+    score = (touchpoint_frequency * w1 + response_rate * w2 + feat_adoption * w3) * decay_factor
+
+    # INSERT OR REPLACE
+    await db.execute(
+        """INSERT INTO engagement_scores
+           (customer_id, score, touchpoint_frequency, response_rate, feature_adoption, last_interaction_days, decay_factor, calculated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(customer_id) DO UPDATE SET
+           score=excluded.score, touchpoint_frequency=excluded.touchpoint_frequency,
+           response_rate=excluded.response_rate, feature_adoption=excluded.feature_adoption,
+           last_interaction_days=excluded.last_interaction_days, decay_factor=excluded.decay_factor,
+           calculated_at=excluded.calculated_at""",
+        (customer_id, round(score, 1), round(touchpoint_frequency, 1),
+         round(response_rate, 1), round(feat_adoption, 1),
+         last_interaction_days, round(decay_factor, 3), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM engagement_scores WHERE customer_id = ?", (customer_id,))
+    return _engagement_score_row(rows[0])
+
+
+async def calculate_all_engagement_scores(db: aiosqlite.Connection) -> dict:
+    customers = await db.execute_fetchall("SELECT id FROM customers")
+    results = []
+    for c in customers:
+        r = await calculate_engagement_score(db, c["id"])
+        if r:
+            results.append(r)
+    avg_score = round(sum(r["score"] for r in results) / max(len(results), 1), 1) if results else 0
+    return {
+        "calculated": len(results),
+        "avg_score": avg_score,
+    }
+
+
+async def list_engagement_scores(db: aiosqlite.Connection,
+                                   min_score: float | None = None,
+                                   max_score: float | None = None,
+                                   sort_by: str | None = None,
+                                   limit: int = 100,
+                                   offset: int = 0) -> list[dict]:
+    q = "SELECT * FROM engagement_scores WHERE 1=1"
+    params: list = []
+    if min_score is not None:
+        q += " AND score >= ?"
+        params.append(min_score)
+    if max_score is not None:
+        q += " AND score <= ?"
+        params.append(max_score)
+    if sort_by == "score_asc":
+        q += " ORDER BY score ASC"
+    elif sort_by == "score_desc":
+        q += " ORDER BY score DESC"
+    elif sort_by == "recent":
+        q += " ORDER BY calculated_at DESC"
+    else:
+        q += " ORDER BY score DESC"
+    q += " LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = await db.execute_fetchall(q, params)
+    return [_engagement_score_row(r) for r in rows]
+
+
+async def get_engagement_score(db: aiosqlite.Connection, customer_id: int) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM engagement_scores WHERE customer_id = ?", (customer_id,))
+    return _engagement_score_row(rows[0]) if rows else None
+
+
+async def get_engagement_alerts(db: aiosqlite.Connection) -> list[dict]:
+    config = await get_engagement_config(db)
+    threshold_low = config["score_threshold_low"]
+    # Customers below threshold
+    low_rows = await db.execute_fetchall(
+        "SELECT e.*, c.name as customer_name FROM engagement_scores e JOIN customers c ON e.customer_id = c.id WHERE e.score < ? ORDER BY e.score ASC",
+        (threshold_low,),
+    )
+    alerts = []
+    for r in low_rows:
+        alerts.append({
+            "customer_id": r["customer_id"],
+            "customer_name": r["customer_name"],
+            "score": round(r["score"], 1),
+            "reason": f"Engagement score {round(r['score'], 1)} below threshold {threshold_low}",
+        })
+    return alerts
+
+
+async def get_engagement_trends(db: aiosqlite.Connection) -> list[dict]:
+    """Weekly average engagement scores for last 12 weeks."""
+    now_dt = datetime.now(timezone.utc)
+    weeks = []
+    for i in range(11, -1, -1):
+        week_start = now_dt - timedelta(weeks=i+1)
+        week_end = now_dt - timedelta(weeks=i)
+        rows = await db.execute_fetchall(
+            "SELECT AVG(score) as avg, COUNT(*) as cnt FROM engagement_scores WHERE calculated_at >= ? AND calculated_at < ?",
+            (week_start.isoformat(), week_end.isoformat()),
+        )
+        avg = round(rows[0]["avg"], 1) if rows and rows[0]["avg"] is not None else 0
+        cnt = rows[0]["cnt"] if rows else 0
+        weeks.append({
+            "week": week_start.strftime("%Y-W%V"),
+            "avg_score": avg,
+            "customer_count": cnt,
+        })
+    return weeks
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Revenue Waterfall (v1.1.0) ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _revenue_event_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "customer_id": r["customer_id"],
+        "event_type": r["event_type"],
+        "mrr_before": round(r["mrr_before"], 2),
+        "mrr_after": round(r["mrr_after"], 2),
+        "mrr_delta": round(r["mrr_delta"], 2),
+        "reason": r["reason"],
+        "created_at": r["created_at"],
+    }
+
+
+async def record_revenue_event(db: aiosqlite.Connection, data: dict) -> dict | None:
+    customer = await get_customer(db, data["customer_id"])
+    if not customer:
+        return None
+    now = _now()
+    mrr_before = data["mrr_before"]
+    mrr_after = data["mrr_after"]
+    mrr_delta = round(mrr_after - mrr_before, 2)
+    cur = await db.execute(
+        """INSERT INTO revenue_events (customer_id, event_type, mrr_before, mrr_after, mrr_delta, reason, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (data["customer_id"], data["event_type"], mrr_before, mrr_after, mrr_delta,
+         data.get("reason"), now),
+    )
+    # Update customer MRR if different
+    if mrr_after != customer["mrr"]:
+        await db.execute("UPDATE customers SET mrr = ? WHERE id = ?", (mrr_after, data["customer_id"]))
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM revenue_events WHERE id = ?", (cur.lastrowid,))
+    return _revenue_event_row(rows[0])
+
+
+async def detect_mrr_changes(db: aiosqlite.Connection) -> list[dict]:
+    """Compare each customer's current MRR with last known revenue event."""
+    customers = await db.execute_fetchall("SELECT * FROM customers")
+    events_created = []
+    now = _now()
+    for c in customers:
+        cid = c["id"]
+        current_mrr = c["mrr"]
+        # Get last revenue event for this customer
+        last_event = await db.execute_fetchall(
+            "SELECT * FROM revenue_events WHERE customer_id = ? ORDER BY created_at DESC LIMIT 1",
+            (cid,),
+        )
+        if last_event:
+            last_mrr = last_event[0]["mrr_after"]
+        else:
+            last_mrr = current_mrr  # No events yet, assume no change
+            continue  # Skip if no prior events
+
+        delta = round(current_mrr - last_mrr, 2)
+        if abs(delta) < 0.01:
+            continue  # No meaningful change
+
+        # Determine event type
+        if last_mrr == 0 and current_mrr > 0:
+            event_type = "reactivation"
+        elif current_mrr == 0:
+            event_type = "churn"
+        elif delta > 0:
+            event_type = "expansion"
+        else:
+            event_type = "contraction"
+
+        cur = await db.execute(
+            """INSERT INTO revenue_events (customer_id, event_type, mrr_before, mrr_after, mrr_delta, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (cid, event_type, last_mrr, current_mrr, delta, "auto-detected", now),
+        )
+        await db.commit()
+        rows = await db.execute_fetchall("SELECT * FROM revenue_events WHERE id = ?", (cur.lastrowid,))
+        events_created.append(_revenue_event_row(rows[0]))
+    return events_created
+
+
+async def list_revenue_events(db: aiosqlite.Connection,
+                                event_type: str | None = None,
+                                from_date: str | None = None,
+                                to_date: str | None = None,
+                                customer_id: int | None = None,
+                                limit: int = 100,
+                                offset: int = 0) -> list[dict]:
+    q = "SELECT * FROM revenue_events WHERE 1=1"
+    params: list = []
+    if event_type:
+        q += " AND event_type = ?"
+        params.append(event_type)
+    if from_date:
+        q += " AND created_at >= ?"
+        params.append(from_date)
+    if to_date:
+        q += " AND created_at <= ?"
+        params.append(to_date + "T23:59:59")
+    if customer_id:
+        q += " AND customer_id = ?"
+        params.append(customer_id)
+    q += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    rows = await db.execute_fetchall(q, params)
+    return [_revenue_event_row(r) for r in rows]
+
+
+async def get_revenue_waterfall(db: aiosqlite.Connection,
+                                  from_date: str | None = None,
+                                  to_date: str | None = None) -> dict:
+    now_dt = datetime.utcnow()
+    if not from_date:
+        from_date = (now_dt - timedelta(days=30)).strftime("%Y-%m-%d")
+    if not to_date:
+        to_date = now_dt.strftime("%Y-%m-%d")
+
+    rows = await db.execute_fetchall(
+        "SELECT * FROM revenue_events WHERE created_at >= ? AND created_at <= ?",
+        (from_date, to_date + "T23:59:59"),
+    )
+
+    new_mrr = sum(r["mrr_delta"] for r in rows if r["event_type"] == "new")
+    expansion = sum(r["mrr_delta"] for r in rows if r["event_type"] == "expansion")
+    contraction = sum(r["mrr_delta"] for r in rows if r["event_type"] == "contraction")
+    churn = sum(r["mrr_delta"] for r in rows if r["event_type"] == "churn")
+    reactivation = sum(r["mrr_delta"] for r in rows if r["event_type"] == "reactivation")
+
+    # Starting MRR: sum of all customer MRR minus net changes in period
+    total_current_mrr = await db.execute_fetchall("SELECT COALESCE(SUM(mrr), 0) as total FROM customers")
+    ending_mrr = round(total_current_mrr[0]["total"], 2)
+    net_change = round(new_mrr + expansion + contraction + churn + reactivation, 2)
+    starting_mrr = round(ending_mrr - net_change, 2)
+
+    # Net retention rate
+    if starting_mrr > 0:
+        net_retention = round((starting_mrr + expansion + contraction + churn) / starting_mrr * 100, 1)
+    else:
+        net_retention = 100.0
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "starting_mrr": starting_mrr,
+        "new": round(new_mrr, 2),
+        "expansion": round(expansion, 2),
+        "contraction": round(contraction, 2),
+        "churn": round(churn, 2),
+        "reactivation": round(reactivation, 2),
+        "ending_mrr": ending_mrr,
+        "net_change": net_change,
+        "net_retention_rate": net_retention,
+    }
+
+
+async def get_monthly_waterfall(db: aiosqlite.Connection) -> list[dict]:
+    """Monthly waterfall for last 12 months."""
+    now_dt = datetime.utcnow()
+    result = []
+    for i in range(11, -1, -1):
+        # First day of month i months ago
+        month_dt = now_dt.replace(day=1) - timedelta(days=i * 30)
+        month_start = month_dt.replace(day=1).strftime("%Y-%m-%d")
+        # Last day of that month
+        if month_dt.month == 12:
+            next_month = month_dt.replace(year=month_dt.year + 1, month=1, day=1)
+        else:
+            next_month = month_dt.replace(month=month_dt.month + 1, day=1)
+        month_end = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
+        month_label = month_dt.strftime("%Y-%m")
+
+        rows = await db.execute_fetchall(
+            "SELECT * FROM revenue_events WHERE created_at >= ? AND created_at <= ?",
+            (month_start, month_end + "T23:59:59"),
+        )
+
+        new_mrr = sum(r["mrr_delta"] for r in rows if r["event_type"] == "new")
+        expansion = sum(r["mrr_delta"] for r in rows if r["event_type"] == "expansion")
+        contraction = sum(r["mrr_delta"] for r in rows if r["event_type"] == "contraction")
+        churn = sum(r["mrr_delta"] for r in rows if r["event_type"] == "churn")
+        reactivation = sum(r["mrr_delta"] for r in rows if r["event_type"] == "reactivation")
+        net = round(new_mrr + expansion + contraction + churn + reactivation, 2)
+
+        result.append({
+            "month": month_label,
+            "starting_mrr": 0,  # Would need historical tracking for accurate value
+            "new": round(new_mrr, 2),
+            "expansion": round(expansion, 2),
+            "contraction": round(contraction, 2),
+            "churn": round(churn, 2),
+            "reactivation": round(reactivation, 2),
+            "ending_mrr": 0,
+            "net_change": net,
+        })
+    return result
+
+
+async def get_top_revenue_changes(db: aiosqlite.Connection,
+                                    limit: int = 10,
+                                    from_date: str | None = None,
+                                    to_date: str | None = None) -> list[dict]:
+    q = """SELECT re.customer_id, c.name as customer_name,
+                  SUM(re.mrr_delta) as total_delta, COUNT(*) as event_count
+           FROM revenue_events re
+           JOIN customers c ON re.customer_id = c.id
+           WHERE 1=1"""
+    params: list = []
+    if from_date:
+        q += " AND re.created_at >= ?"
+        params.append(from_date)
+    if to_date:
+        q += " AND re.created_at <= ?"
+        params.append(to_date + "T23:59:59")
+    q += " GROUP BY re.customer_id ORDER BY ABS(SUM(re.mrr_delta)) DESC LIMIT ?"
+    params.append(limit)
+    rows = await db.execute_fetchall(q, params)
+    return [{
+        "customer_id": r["customer_id"],
+        "customer_name": r["customer_name"],
+        "total_delta": round(r["total_delta"], 2),
+        "event_count": r["event_count"],
+    } for r in rows]
