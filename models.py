@@ -661,3 +661,148 @@ class FeedbackStats(BaseModel):
     by_priority: dict  # {critical: N, ...}
     top_voted: list[FeedbackResponse]
     recent: list[FeedbackResponse]
+
+
+# ==========================================================================
+# == v1.1.0 Feature 1: Customer Cohort Analysis ===========================
+# ==========================================================================
+
+class CohortCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    cohort_type: str = Field(
+        ..., description="signup_month | plan | segment | custom"
+    )
+    criteria: Optional[dict] = Field(default_factory=dict, description="Criteria for matching customers")
+
+
+class CohortResponse(BaseModel):
+    id: int
+    name: str
+    cohort_type: str
+    criteria: dict
+    created_at: str
+    latest_snapshot: Optional[dict] = None
+
+
+class CohortSnapshotResponse(BaseModel):
+    id: int
+    cohort_id: int
+    snapshot_date: str
+    customer_count: int
+    avg_health: float
+    avg_mrr: float
+    churned_count: int
+    expanded_count: int
+    nps_avg: float
+    created_at: str
+
+
+class CohortComparison(BaseModel):
+    cohorts: list[dict]
+
+
+# ==========================================================================
+# == v1.1.0 Feature 2: Engagement Scoring =================================
+# ==========================================================================
+
+class EngagementScoreResponse(BaseModel):
+    id: int
+    customer_id: int
+    score: float
+    touchpoint_frequency: float
+    response_rate: float
+    feature_adoption: float
+    last_interaction_days: int
+    decay_factor: float
+    calculated_at: str
+
+
+class EngagementConfigResponse(BaseModel):
+    id: int
+    touchpoint_weight: float
+    response_weight: float
+    adoption_weight: float
+    decay_rate_per_day: float
+    score_threshold_high: float
+    score_threshold_low: float
+    updated_at: str
+
+
+class EngagementConfigUpdate(BaseModel):
+    touchpoint_weight: Optional[float] = None
+    response_weight: Optional[float] = None
+    adoption_weight: Optional[float] = None
+    decay_rate_per_day: Optional[float] = None
+    score_threshold_high: Optional[float] = None
+    score_threshold_low: Optional[float] = None
+
+
+class EngagementAlertItem(BaseModel):
+    customer_id: int
+    customer_name: str
+    score: float
+    reason: str
+
+
+class EngagementTrendPoint(BaseModel):
+    week: str
+    avg_score: float
+    customer_count: int
+
+
+# ==========================================================================
+# == v1.1.0 Feature 3: Revenue Waterfall ==================================
+# ==========================================================================
+
+class RevenueEventCreate(BaseModel):
+    customer_id: int
+    event_type: str = Field(
+        ..., description="new | expansion | contraction | churn | reactivation"
+    )
+    mrr_before: float = Field(..., ge=0)
+    mrr_after: float = Field(..., ge=0)
+    reason: Optional[str] = None
+
+
+class RevenueEventResponse(BaseModel):
+    id: int
+    customer_id: int
+    event_type: str
+    mrr_before: float
+    mrr_after: float
+    mrr_delta: float
+    reason: Optional[str]
+    created_at: str
+
+
+class RevenueWaterfall(BaseModel):
+    from_date: str
+    to_date: str
+    starting_mrr: float
+    new: float
+    expansion: float
+    contraction: float
+    churn: float
+    reactivation: float
+    ending_mrr: float
+    net_change: float
+    net_retention_rate: float
+
+
+class MonthlyWaterfallEntry(BaseModel):
+    month: str
+    starting_mrr: float
+    new: float
+    expansion: float
+    contraction: float
+    churn: float
+    reactivation: float
+    ending_mrr: float
+    net_change: float
+
+
+class TopRevenueChange(BaseModel):
+    customer_id: int
+    customer_name: str
+    total_delta: float
+    event_count: int
