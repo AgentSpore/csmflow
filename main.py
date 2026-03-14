@@ -30,6 +30,9 @@ from models import (
     SuccessPlanCreate, SuccessPlanUpdate,
     PlanTaskCreate, PlanTaskUpdate,
     FeedbackCreate, FeedbackUpdate, FeedbackVote,
+    CohortCreate,
+    EngagementConfigUpdate,
+    RevenueEventCreate,
 )
 import engine as _engine
 
@@ -51,7 +54,7 @@ class CSMFlowEngine:
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="CSMFlow", version="1.0.0")
+app = FastAPI(title="CSMFlow", version="1.1.0")
 
 
 @app.on_event("startup")
@@ -1224,6 +1227,297 @@ async def vote_feedback(feedback_id: int, body: FeedbackVote, request: Request):
         return result
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# Cohort Analysis (v1.1.0)
+# ===========================================================================
+
+@app.post("/cohorts", status_code=201)
+async def create_cohort(body: CohortCreate, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.create_cohort(db, body.model_dump())
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cohorts")
+async def list_cohorts(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.list_cohorts(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cohorts/{cohort_id}")
+async def get_cohort(cohort_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.get_cohort(db, cohort_id)
+        if result is None:
+            _404(f"Cohort {cohort_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/cohorts/{cohort_id}", status_code=204)
+async def delete_cohort(cohort_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        deleted = await _engine.delete_cohort(db, cohort_id)
+        if not deleted:
+            _404(f"Cohort {cohort_id} not found")
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cohorts/{cohort_id}/snapshot", status_code=201)
+async def take_cohort_snapshot(cohort_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.take_cohort_snapshot(db, cohort_id)
+        if result is None:
+            _404(f"Cohort {cohort_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cohorts/{cohort_id}/snapshots")
+async def list_cohort_snapshots(cohort_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        cohort = await _engine.get_cohort(db, cohort_id)
+        if cohort is None:
+            _404(f"Cohort {cohort_id} not found")
+        return await _engine.list_cohort_snapshots(db, cohort_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cohorts/{cohort_id}/customers")
+async def list_cohort_customers(cohort_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.list_cohort_customers(db, cohort_id)
+        if result is None:
+            _404(f"Cohort {cohort_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analytics/cohort-comparison")
+async def compare_cohorts(
+    request: Request,
+    cohort_ids: Optional[str] = Query(None, description="Comma-separated cohort IDs"),
+):
+    try:
+        db = _engine_db(request)
+        ids = None
+        if cohort_ids:
+            ids = [int(x.strip()) for x in cohort_ids.split(",") if x.strip()]
+        return await _engine.compare_cohorts(db, cohort_ids=ids)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# Engagement Scoring (v1.1.0)
+# ===========================================================================
+
+@app.post("/engagement/calculate/{customer_id}", status_code=201)
+async def calculate_engagement_score(customer_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.calculate_engagement_score(db, customer_id)
+        if result is None:
+            _404(f"Customer {customer_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/engagement/calculate-all", status_code=201)
+async def calculate_all_engagement_scores(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.calculate_all_engagement_scores(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engagement/scores")
+async def list_engagement_scores(
+    request: Request,
+    min_score: Optional[float] = Query(None),
+    max_score: Optional[float] = Query(None),
+    sort_by: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        db = _engine_db(request)
+        return await _engine.list_engagement_scores(
+            db, min_score=min_score, max_score=max_score,
+            sort_by=sort_by, limit=limit, offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engagement/scores/{customer_id}")
+async def get_engagement_score(customer_id: int, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.get_engagement_score(db, customer_id)
+        if result is None:
+            _404(f"Engagement score for customer {customer_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engagement/config")
+async def get_engagement_config(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_engagement_config(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/engagement/config")
+async def update_engagement_config(body: EngagementConfigUpdate, request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.update_engagement_config(db, body.model_dump(exclude_none=True))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engagement/alerts")
+async def get_engagement_alerts(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_engagement_alerts(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/engagement/trends")
+async def get_engagement_trends(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_engagement_trends(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===========================================================================
+# Revenue Waterfall (v1.1.0)
+# ===========================================================================
+
+@app.post("/revenue/events", status_code=201)
+async def create_revenue_event(body: RevenueEventCreate, request: Request):
+    try:
+        db = _engine_db(request)
+        result = await _engine.record_revenue_event(db, body.model_dump())
+        if result is None:
+            _404(f"Customer {body.customer_id} not found")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/revenue/detect-changes")
+async def detect_mrr_changes(request: Request):
+    try:
+        db = _engine_db(request)
+        events = await _engine.detect_mrr_changes(db)
+        return {"detected": len(events), "events": events}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/revenue/events")
+async def list_revenue_events(
+    request: Request,
+    event_type: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+    customer_id: Optional[int] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        db = _engine_db(request)
+        return await _engine.list_revenue_events(
+            db, event_type=event_type, from_date=from_date,
+            to_date=to_date, customer_id=customer_id,
+            limit=limit, offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/revenue/waterfall")
+async def get_revenue_waterfall(
+    request: Request,
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_revenue_waterfall(db, from_date=from_date, to_date=to_date)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/revenue/waterfall/monthly")
+async def get_monthly_waterfall(request: Request):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_monthly_waterfall(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/revenue/top-changes")
+async def get_top_revenue_changes(
+    request: Request,
+    limit: int = Query(10, ge=1, le=100),
+    from_date: Optional[str] = Query(None),
+    to_date: Optional[str] = Query(None),
+):
+    try:
+        db = _engine_db(request)
+        return await _engine.get_top_revenue_changes(
+            db, limit=limit, from_date=from_date, to_date=to_date,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
